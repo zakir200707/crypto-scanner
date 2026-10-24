@@ -21,16 +21,18 @@ jobs:
       - name: Restore last pick
         uses: actions/cache/restore@v4
         with:
-          path: state.txt
+          path: state
           key: state-${{ github.run_id }}
           restore-keys: state-
       - name: Scan
         env:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
-        run: python scanner.py --state state.txt --ntfy "$NTFY_TOPIC"
+        run: |
+          mkdir -p state
+          python scanner.py --state state/last.txt --wallets state/wallets.json --ntfy "$NTFY_TOPIC"
       - name: Save last pick
         if: always()
         uses: actions/cache/save@v4
         with:
-          path: state.txt
+          path: state
           key: state-${{ github.run_id }}

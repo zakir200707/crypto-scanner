@@ -2,7 +2,9 @@
 
 Pulls trending/boosted/high-volume Solana tokens from DexScreener and GeckoTerminal,
 drops fakes, bot-wash volume, rugs and copycats, then scores the survivors on:
-volume/MC, buyer dominance, pullback entry (20-40% off 24h high), floor holding, safety.
+volume/MC, buyer dominance, pullback entry (20-40% off 24h high), floor holding, safety,
+and smart money: whale ($300+) net flow, wallets quietly accumulating, and "smart wallets"
+the scanner has seen buy other tokens early before they doubled (learned over time in wallets.json).
 
 Usage:
     python scanner.py              # one scan
@@ -31,6 +33,13 @@ MIN_AVG_TRADE = 25        # USD; below this the "volume" is mostly bot spam
 MIN_TXNS_24H = 500
 MAX_TOP_HOLDER = 10       # % held by largest non-pool wallet
 MIN_LP_LOCKED = 80        # %
+
+# Smart money
+WHALE_USD = 300           # a "whale" trade on a sub-$5M memecoin
+LEARN_TOKENS = 12         # extra trending tokens per scan whose whale buyers get recorded
+SMART_WIN_X = 2.0         # a wallet "wins" if the token later trades at 2x its entry
+SMART_LOSS_X = 0.5        # ...and "loses" if it later trades at half its entry
+TRACK_DAYS = 7
 
 
 def get(url, tries=3):
@@ -179,63 +188,188 @@ def safety(m):
     return None
 
 
+def trades(pair, min_usd=0):
+    """Recent trades (max 300, last 24h) with the wallet behind each one."""
+    url = f"{GT}/pools/{pair}/trades" + (f"?trade_volume_in_usd_greater_than={min_usd}" if min_usd else "")
+    out = []
+    for t in (get(url) or {}).get("data") or []:
+        a = t["attributes"]
+        buy = a["kind"] == "buy"
+        out.append({
+            "w": a["tx_from_address"], "buy": buy, "usd": float(a.get("volume_in_usd") or 0),
+            "price": float((a["price_to_in_usd"] if buy else a["price_from_in_usd"]) or 0),
+            "ts": datetime.fromisoformat(a["block_timestamp"].replace("Z", "+00:00")).timestamp(),
+        })
+    return out
+
+
+def record_entries(db, mint, whale_trades):
+    """Remember each whale's first buy price so we can later tell if they were early."""
+    pos = db["positions"].setdefault(mint, {"t": time.time(), "entries": {}})
+    for t in sorted(whale_trades, key=lambda x: x["ts"]):
+        if t["buy"] and t["price"] and t["w"] not in pos["entries"] and len(pos["entries"]) < 300:
+            pos["entries"][t["w"]] = t["price"]
+
+
+def is_smart(rec):
+    return rec["w"] >= 2 and rec["w"] >= rec["l"]
+
+
+def learn(db, prices):
+    """Grade recorded whale entries against today's price: 2x = win, half = loss."""
+    now = time.time()
+    missing = [m for m in db["positions"] if m not in prices]
+    for i in range(0, len(missing), 30):
+        for p in get(f"{DEX}/tokens/v1/solana/{','.join(missing[i:i + 30])}") or []:
+            a = p["baseToken"]["address"]
+            liq = (p.get("liquidity") or {}).get("usd") or 0
+            if a in missing and (a not in prices or liq > prices[a][1]):
+                prices[a] = (float(p.get("priceUsd") or 0), liq)
+        time.sleep(0.3)
+    for mint in list(db["positions"]):
+        pos = db["positions"][mint]
+        px = prices.get(mint, (0, 0))[0]
+        for w, entry in list(pos["entries"].items()):
+            rec = db["wallets"].setdefault(w, {"w": 0, "l": 0})
+            if px >= entry * SMART_WIN_X:
+                rec["w"] += 1; del pos["entries"][w]
+            elif (px and px <= entry * SMART_LOSS_X) or (not px and now - pos["t"] > 86400):
+                rec["l"] += 1; del pos["entries"][w]
+        if now - pos["t"] > TRACK_DAYS * 86400 or not pos["entries"]:
+            del db["positions"][mint]
+    # keep the file small: forget wallets that only ever lose
+    db["wallets"] = {w: r for w, r in db["wallets"].items() if r["w"] or r["l"] < 3}
+
+
+def flow(m, db):
+    """Wallet-level order flow: real unique buyers, whale accumulation, smart wallets."""
+    recent = trades(m["pair"]); time.sleep(2.2)
+    whales = trades(m["pair"], WHALE_USD); time.sleep(2.2)
+    if not recent:
+        return "no trade data"
+    now = time.time()
+    buyers = {t["w"] for t in recent if t["buy"]}
+    sellers = {t["w"] for t in recent if not t["buy"]}
+    buy_vol = {}
+    for t in recent:
+        if t["buy"]:
+            buy_vol[t["w"]] = buy_vol.get(t["w"], 0) + t["usd"]
+    total_buy = sum(buy_vol.values()) or 1
+    m["uniq_buyers"], m["uniq_sellers"] = len(buyers), len(sellers)
+    m["wallet_bs"] = len(buyers) / max(len(sellers), 1)
+    m["top_buyer_share"] = max(buy_vol.values(), default=0) / total_buy
+
+    def net(since):
+        b = sum(t["usd"] for t in whales if t["buy"] and t["ts"] >= since)
+        s = sum(t["usd"] for t in whales if not t["buy"] and t["ts"] >= since)
+        return b, s
+    wb6, ws6 = net(now - 6 * 3600)
+    wb24, ws24 = net(0)
+    m["whale_net_6h"], m["whale_net_24h"] = wb6 - ws6, wb24 - ws24
+    m["whale_buy_24h"], m["whale_sell_24h"] = wb24, ws24
+
+    whale_sellers = {t["w"] for t in whales if not t["buy"]} | sellers
+    whale_buys = {}
+    for t in whales:
+        if t["buy"]:
+            whale_buys[t["w"]] = whale_buys.get(t["w"], 0) + 1
+    m["accumulators"] = sum(1 for w, n in whale_buys.items() if n >= 2 and w not in whale_sellers)
+    smart = [w for w in whale_buys if w not in whale_sellers and is_smart(db["wallets"].get(w, {"w": 0, "l": 0}))]
+    m["smart_buyers"] = len(smart)
+    m["smart_wallets"] = smart[:5]
+    record_entries(db, m["mint"], whales)
+
+    if ws24 > 2 * wb24 and ws24 > 2000:
+        return f"whales dumping (${ws24:,.0f} sold vs ${wb24:,.0f} bought, 24h)"
+    if m["top_buyer_share"] > 0.4 and len(buyers) > 5:
+        return f"one wallet is {m['top_buyer_share']:.0%} of recent buying (fake pump)"
+    if m["wallet_bs"] < 0.9:
+        return f"more unique sellers than buyers ({len(sellers)} vs {len(buyers)})"
+    return None
+
+
 def score(m):
     s, why = 0.0, []
-    # Volume interest (20)
-    s += min(m["vol_mc"] / 3, 1) * 20
-    # Buyer dominance across windows (25)
+    # Volume interest (15)
+    s += min(m["vol_mc"] / 3, 1) * 15
+    # Buyer dominance: txn ratios + real unique wallets (20)
     avg_bs = (m["bs_5m"] + m["bs_1h"] + m["bs_6h"]) / 3
-    s += min(max(avg_bs - 1, 0) / 0.8, 1) * 20
+    s += min(max(avg_bs - 1, 0) / 0.8, 1) * 8
+    s += min(max(m["wallet_bs"] - 1, 0) / 0.8, 1) * 7
     if m["bs_5m"] >= m["bs_1h"] >= m["bs_6h"] >= 1:
         s += 5; why.append("buyer pressure rising 6h->1h->5m")
-    # Entry: pullback depth (20)
+    # Entry: pullback depth (15)
     dd = -m["from_24h_high"]
     if 20 <= dd <= 40:
-        s += 20; why.append(f"{dd:.0f}% pullback (in 20-40% zone)")
+        s += 15; why.append(f"{dd:.0f}% pullback (in 20-40% zone)")
     elif 12 <= dd < 20 or 40 < dd <= 50:
-        s += 10
+        s += 7
     # Floor holding (10)
     if m["higher_low"]:
         s += 6; why.append("higher low vs prior 18h")
     if 0 <= m["above_6h_low"] <= 35:
         s += 4
-    # Real trade size (5)
-    s += min(m["avg_trade_1h"] / 100, 1) * 5
-    # Safety (20)
-    s += 20
-    if m["insider_wallets"] > 300: s -= 8
-    elif m["insider_wallets"] > 100: s -= 4
-    if any("copycat" in r.lower() for r in m["risks"]): s -= 8
+    # Smart money (25)
+    if m["whale_net_6h"] > 0:
+        s += min(m["whale_net_6h"] / max(m["liq"] * 0.05, 1), 1) * 8
+        why.append(f"whales net bought ${m['whale_net_6h']:,.0f} in 6h")
+    if m["accumulators"]:
+        s += min(m["accumulators"], 4) * 1.5
+        why.append(f"{m['accumulators']} whale wallets accumulating (2+ buys, no sells)")
+    if m["smart_buyers"]:
+        s += min(m["smart_buyers"], 3) * 4
+        why.append(f"{m['smart_buyers']} proven smart wallets buying")
+    # Safety (15)
+    s += 15
+    if m["insider_wallets"] > 300: s -= 6
+    elif m["insider_wallets"] > 100: s -= 3
+    if any("copycat" in r.lower() for r in m["risks"]): s -= 6
     s -= min(len([r for r in m["risks"] if r.startswith("warn")]) * 2, 6)
-    if m["top10_pct"] > 30: s -= 4
+    if m["top10_pct"] > 30: s -= 3
     # Age maturity: tokens that survived past 3 days are less likely to be day-one rugs
     if m["age_h"] > 72: s += 3
-    m["score"] = round(s, 1)
+    m["score"] = round(min(s, 100), 1)
     m["why"] = why
     return m
 
 
-def scan(min_age_h, verbose=True):
+def scan(min_age_h, db, verbose=True):
     log = print if verbose else (lambda *a, **k: None)
     log(f"[{datetime.now():%H:%M:%S}] gathering candidates...")
     mints = gather_candidates()
     pairs = best_pairs(mints)
     log(f"  {len(mints)} tokens, {len(pairs)} with Solana pairs")
     passed, rejected = [], {}
-    s1 = []
+    s1, all_m = [], []
     for p in pairs:
         m, why = stage1(p, min_age_h)
+        all_m.append(m)
         (rejected.__setitem__(m["symbol"], why) if why else s1.append(m))
-    log(f"  {len(s1)} passed liquidity/volume/bot/age filters; checking charts + safety...")
+    log(f"  {len(s1)} passed liquidity/volume/bot/age filters; checking charts, safety, wallets...")
     for m in sorted(s1, key=lambda x: -x["vol_mc"])[:25]:
         why = price_structure(m); time.sleep(2.2)
         if not why:
             why = safety(m); time.sleep(1)
+        if not why:
+            why = flow(m, db)
         if why:
             rejected[m["symbol"]] = why
         else:
             passed.append(score(m))
     passed.sort(key=lambda x: -x["score"])
+
+    # Smart-wallet learning: record whale buyers in other real, active tokens (any age),
+    # then grade every recorded entry against current prices.
+    done = {m["mint"] for m in s1}
+    learn_set = [m for m in all_m if m["mint"] not in done and m["liq"] >= 30_000 and m["mc"]
+                 and m["avg_trade_24h"] >= MIN_AVG_TRADE and m["txns_24h"] >= MIN_TXNS_24H]
+    for m in sorted(learn_set, key=lambda x: -x["vol_mc"])[:LEARN_TOKENS]:
+        record_entries(db, m["mint"], trades(m["pair"], WHALE_USD)); time.sleep(2.2)
+    learn(db, {m["mint"]: (m["price"], m["liq"]) for m in all_m})
+    smart_n = sum(1 for r in db["wallets"].values() if is_smart(r))
+    early_n = sum(1 for r in db["wallets"].values() if r["w"])
+    log(f"  smart-wallet memory: {early_n} wallets caught a 2x early, {smart_n} proven smart (2+ wins), "
+        f"{len(db['positions'])} tokens being tracked")
     return passed, rejected, s1
 
 
@@ -265,6 +399,9 @@ def report(passed, rejected, s1):
           f"{b['from_24h_high']:.0f}% off 24h high | 24h {b['pc_24h']}%")
     print(f"  holders {b['holders']} | top wallet {b['top_holder_pct']:.1f}% | top10 {b['top10_pct']:.1f}% | "
           f"insider wallets {b['insider_wallets']} | LP locked {b['lp_locked']:.0f}%")
+    print(f"  wallets: {b['uniq_buyers']} buyers vs {b['uniq_sellers']} sellers (last 300 trades) | "
+          f"whale net 6h ${b['whale_net_6h']:,.0f}, 24h ${b['whale_net_24h']:,.0f} | "
+          f"accumulators {b['accumulators']} | smart wallets {b['smart_buyers']}")
     if b["why"]:
         print("  + " + "; ".join(b["why"]))
     if b["risks"]:
@@ -286,6 +423,8 @@ def push(topic, b):
     """Phone alert via ntfy.sh (install the ntfy app and subscribe to the same topic)."""
     msg = (f"{b['name']} ({b['symbol']}) score {b['score']}\n"
            f"MC {fmt_money(b['mc'])} | liq {fmt_money(b['liq'])} | {b['from_24h_high']:.0f}% off 24h high\n"
+           f"Whales net 6h ${b['whale_net_6h']:,.0f} | accumulators {b['accumulators']} | "
+           f"smart wallets {b['smart_buyers']}\n"
            f"{'; '.join(b['risks']) or 'no rugcheck warnings'}\n{b['url']}")
     title = f"New pick: {b['symbol']}".encode("ascii", "ignore").decode()
     try:
@@ -302,12 +441,27 @@ def main():
     ap.add_argument("--min-age", type=float, default=24, help="minimum pair age in hours (default 24)")
     ap.add_argument("--ntfy", help="ntfy.sh topic for phone alerts on new picks")
     ap.add_argument("--state", help="file remembering the last alerted pick (for one-shot runs, e.g. GitHub Actions)")
+    ap.add_argument("--wallets", default=os.path.join(OUT_DIR, "wallets.json"),
+                    help="smart-wallet memory file (grows more useful over days)")
     a = ap.parse_args()
+    db = {"wallets": {}, "positions": {}}
+    if os.path.exists(a.wallets):
+        try:
+            db.update(json.load(open(a.wallets)))
+        except ValueError:
+            pass
+
+    def save_db():
+        os.makedirs(os.path.dirname(os.path.abspath(a.wallets)), exist_ok=True)
+        with open(a.wallets, "w") as f:
+            json.dump(db, f)
+
     last_best = None
     if a.state and os.path.exists(a.state):
         last_best = open(a.state).read().strip() or None
     if a.state and a.loop is None:
-        passed, rejected, s1 = scan(a.min_age)
+        passed, rejected, s1 = scan(a.min_age, db)
+        save_db()
         best = report(passed, rejected, s1)
         if best and best["mint"] != last_best and best["score"] >= 60:
             print("*** NEW BEST PICK ***")
@@ -317,7 +471,8 @@ def main():
             f.write(best["mint"] if best else "")
         return
     while True:
-        passed, rejected, s1 = scan(a.min_age)
+        passed, rejected, s1 = scan(a.min_age, db)
+        save_db()
         best = report(passed, rejected, s1)
         print(f"\nsaved {save(passed, rejected)}")
         if a.loop is None:
