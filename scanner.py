@@ -34,13 +34,22 @@ MIN_TXNS_24H = 500
 MAX_TOP_HOLDER = 10       # % held by largest non-pool wallet
 MIN_LP_LOCKED = 80        # %
 
+# Early-gem tier (younger/smaller coins: bigger upside, many more rugs)
+EARLY_MIN_LIQ = 15_000
+EARLY_MIN_AGE = 2         # hours; need some candles to judge
+EARLY_MAX_MC = 3_000_000
+EARLY_MIN_VOL_MC = 1.0
+EARLY_MIN_TXNS = 300
+ALERT_MAIN = 60
+ALERT_EARLY = 65          # higher bar because the tier is riskier
+
 # Smart money
 WHALE_USD = 300           # a "whale" trade on a sub-$5M memecoin
-LEARN_TOKENS = 12         # extra trending tokens per scan whose whale buyers get recorded
+LEARN_TOKENS = 8          # extra trending tokens per scan whose whale buyers get recorded
 SMART_WIN_X = 2.0         # a wallet "wins" if the token later trades at 2x its entry
 SMART_LOSS_X = 0.5        # ...and "loses" if it later trades at half its entry
 TRACK_DAYS = 7
-GT_GAP = 3.0             # seconds between GeckoTerminal calls
+GT_GAP = 4.0             # seconds between GeckoTerminal calls
 
 
 _last_gt = [0.0]
@@ -79,9 +88,9 @@ def gather_candidates():
                 mints.add(p["baseToken"]["address"])
     # Go well beyond the front page: trending over several windows, deep volume and
     # transaction rankings, and freshly created pools, so quiet risers get caught too.
-    gt_paths = [f"/trending_pools?duration={d}&page={i}" for d in ("1h", "6h", "24h") for i in (1, 2)] + \
-               [f"/pools?sort=h24_volume_usd_desc&page={i}" for i in range(1, 6)] + \
-               [f"/pools?sort=h24_tx_count_desc&page={i}" for i in range(1, 4)] + \
+    gt_paths = [f"/trending_pools?duration={d}" for d in ("1h", "6h", "24h")] + \
+               [f"/pools?sort=h24_volume_usd_desc&page={i}" for i in range(1, 5)] + \
+               [f"/pools?sort=h24_tx_count_desc&page={i}" for i in (1, 2)] + \
                [f"/new_pools?page={i}" for i in (1, 2)]
     for path in gt_paths:
         d = get(GT + path) or {}
@@ -130,34 +139,50 @@ def stage1(p, min_age_h):
         "pc_5m": pc.get("m5"), "pc_1h": pc.get("h1"), "pc_6h": pc.get("h6"), "pc_24h": pc.get("h24"),
         "txns_24h": n24, "age_h": age_h,
     }
-    if not mc or liq < MIN_LIQ:
-        return m, "liquidity < $50K"
+    if not mc or liq < EARLY_MIN_LIQ:
+        return m, "liquidity too low"
     if liq > mc * 1.5:
         return m, "liquidity > MC (fake pool)"
-    if n24 < MIN_TXNS_24H:
-        return m, "too few trades"
-    if m["vol_mc"] < MIN_VOL_MC:
-        return m, f"vol/MC {m['vol_mc']:.2f} < 0.5"
     if m["avg_trade_24h"] < MIN_AVG_TRADE or m["avg_trade_1h"] < MIN_AVG_TRADE:
         return m, f"avg trade ${min(m['avg_trade_24h'], m['avg_trade_1h']):.0f} (bot volume)"
-    if age_h < min_age_h:
-        return m, f"age {age_h:.0f}h < {min_age_h}h"
     if m["bs_1h"] < 1.0 or m["bs_6h"] < 1.0:
         return m, "sellers dominate"
+    if liq >= MIN_LIQ and age_h >= min_age_h:
+        m["tier"] = "main"
+        if n24 < MIN_TXNS_24H:
+            return m, "too few trades"
+        if m["vol_mc"] < MIN_VOL_MC:
+            return m, f"vol/MC {m['vol_mc']:.2f} < 0.5"
+        return m, None
+    # Early gem tier: younger or smaller coins, held to a higher activity bar
+    m["tier"] = "early"
+    if age_h < EARLY_MIN_AGE:
+        return m, f"age {age_h:.1f}h < {EARLY_MIN_AGE}h"
+    if mc > EARLY_MAX_MC:
+        return m, "too big for early tier"
+    if n24 < EARLY_MIN_TXNS:
+        return m, "too few trades"
+    if m["vol_mc"] < EARLY_MIN_VOL_MC:
+        return m, f"vol/MC {m['vol_mc']:.2f} < {EARLY_MIN_VOL_MC}"
     return m, None
 
 
 def price_structure(m):
-    """Drawdown from 24h high and floor check from GeckoTerminal hourly candles."""
-    d = get(f"{GT}/pools/{m['pair']}/ohlcv/hour?limit=72") or {}
+    """Drawdown from 24h high and floor check from GeckoTerminal candles
+    (hourly for mature coins, 15-minute for young ones)."""
+    young = m["age_h"] < 30
+    tf = "minute?aggregate=15&limit=96" if young else "hour?limit=72"
+    per_h = 4 if young else 1
+    d = get(f"{GT}/pools/{m['pair']}/ohlcv/{tf}") or {}
     c = sorted(((d.get("data") or {}).get("attributes") or {}).get("ohlcv_list") or [])
     if len(c) < 8:
         return "no candle history"
     px = m["price"]
-    hi24 = max(x[2] for x in c[-24:])
+    hi24 = max(x[2] for x in c[-24 * per_h:])
     hi72 = max(x[2] for x in c)
-    lo6 = min(x[3] for x in c[-6:])
-    lo_prev = min(x[3] for x in c[-24:-6]) if len(c) > 24 else min(x[3] for x in c[:-6])
+    lo6 = min(x[3] for x in c[-6 * per_h:])
+    prev = c[-24 * per_h:-6 * per_h] or c[:-6 * per_h] or c[:1]
+    lo_prev = min(x[3] for x in prev)
     m["from_24h_high"] = (px / hi24 - 1) * 100
     m["from_72h_high"] = (px / hi72 - 1) * 100
     m["above_6h_low"] = (px / lo6 - 1) * 100
@@ -327,6 +352,8 @@ def score(m):
     if m["whale_net_6h"] > 0:
         s += min(m["whale_net_6h"] / max(m["liq"] * 0.05, 1), 1) * 8
         why.append(f"whales net bought ${m['whale_net_6h']:,.0f} in 6h")
+    elif m["whale_net_6h"] < 0:  # big money leaving outweighs small buyers arriving
+        s -= min(-m["whale_net_6h"] / max(m["liq"] * 0.05, 1), 1) * 10
     if m["accumulators"]:
         s += min(m["accumulators"], 4) * 1.5
         why.append(f"{m['accumulators']} whale wallets accumulating (2+ buys, no sells)")
@@ -358,16 +385,18 @@ def scan(min_age_h, db, verbose=True):
     for p in pairs:
         m, why = stage1(p, min_age_h)
         all_m.append(m)
-        (rejected.__setitem__(m["symbol"], why) if why else s1.append(m))
+        (rejected.__setitem__(m["mint"], (m["symbol"], why)) if why else s1.append(m))
     log(f"  {len(s1)} passed liquidity/volume/bot/age filters; checking charts, safety, wallets...")
-    for m in sorted(s1, key=lambda x: -x["vol_mc"])[:25]:
+    main = sorted([m for m in s1 if m["tier"] == "main"], key=lambda x: -x["vol_mc"])[:10]
+    early = sorted([m for m in s1 if m["tier"] == "early"], key=lambda x: -x["vol_mc"])[:8]
+    for m in main + early:
         why = price_structure(m)
         if not why:
             why = safety(m); time.sleep(1)
         if not why:
             why = flow(m, db)
         if why:
-            rejected[m["symbol"]] = why
+            rejected[m["mint"]] = (m["symbol"], why)
         else:
             passed.append(score(m))
     passed.sort(key=lambda x: -x["score"])
@@ -396,12 +425,22 @@ def report(passed, rejected, s1):
     if rejected:
         print("Rejected after deeper checks:")
         for m in s1:
-            if m["symbol"] in rejected:
-                print(f"  - {m['symbol']:<12} {rejected[m['symbol']]}")
-    if not passed:
-        print("\nNo token passed every filter right now. Best move: don't buy; rescan later.")
-        return None
-    print(f"\n{'#':<3}{'token':<13}{'score':>6}{'MC':>10}{'liq':>9}{'v/MC':>6}{'off24hHi':>9}{'b/s 5m/1h/6h':>16}{'age':>6}")
+            if m["mint"] in rejected:
+                print(f"  - {m['symbol'][:12]:<12} {rejected[m['mint']][1]}")
+    best = {}
+    for tier, label, bar in (("main", "MAIN (24h+ old, $50K+ liquidity)", ALERT_MAIN),
+                             ("early", "EARLY GEMS (younger/smaller - high risk)", ALERT_EARLY)):
+        tp = [m for m in passed if m["tier"] == tier]
+        print(f"\n--- {label} ---")
+        if not tp:
+            print("No token passed every filter right now. Best move: don't buy; rescan later.")
+            continue
+        best[tier] = describe(tp, bar)
+    return best
+
+
+def describe(passed, bar):
+    print(f"{'#':<3}{'token':<13}{'score':>6}{'MC':>10}{'liq':>9}{'v/MC':>6}{'off24hHi':>9}{'b/s 5m/1h/6h':>16}{'age':>6}")
     for i, m in enumerate(passed[:10], 1):
         print(f"{i:<3}{m['symbol'][:12]:<13}{m['score']:>6}{fmt_money(m['mc']):>10}{fmt_money(m['liq']):>9}"
               f"{m['vol_mc']:>6.1f}{m['from_24h_high']:>8.0f}%"
@@ -420,8 +459,8 @@ def report(passed, rejected, s1):
         print("  + " + "; ".join(b["why"]))
     if b["risks"]:
         print("  ! " + "; ".join(b["risks"]))
-    if b["score"] < 60:
-        print("  NOTE: best score is under 60 - weak setup; consider skipping.")
+    if b["score"] < bar:
+        print(f"  NOTE: best score is under {bar} - weak setup; consider skipping.")
     return b
 
 
@@ -429,7 +468,8 @@ def save(passed, rejected):
     os.makedirs(OUT_DIR, exist_ok=True)
     path = os.path.join(OUT_DIR, f"scan_{datetime.now():%Y%m%d_%H%M}.json")
     with open(path, "w") as f:
-        json.dump({"time": datetime.now().isoformat(), "passed": passed, "rejected": rejected}, f, indent=1)
+        json.dump({"time": datetime.now().isoformat(), "passed": passed,
+                   "rejected": {k: list(v) for k, v in rejected.items()}}, f, indent=1)
     return path
 
 
@@ -440,7 +480,8 @@ def push(topic, b):
            f"Whales net 6h ${b['whale_net_6h']:,.0f} | accumulators {b['accumulators']} | "
            f"smart wallets {b['smart_buyers']}\n"
            f"{'; '.join(b['risks']) or 'no rugcheck warnings'}\n{b['url']}")
-    title = f"New pick: {b['symbol']}".encode("ascii", "ignore").decode()
+    kind = "EARLY GEM (high risk)" if b["tier"] == "early" else "New pick"
+    title = f"{kind}: {b['symbol']}".encode("ascii", "ignore").decode()
     try:
         req = urllib.request.Request(f"https://ntfy.sh/{topic}", data=msg.encode(),
                                      headers={"Title": title, "Click": b["url"] or ""})
@@ -458,6 +499,7 @@ def main():
     ap.add_argument("--wallets", default=os.path.join(OUT_DIR, "wallets.json"),
                     help="smart-wallet memory file (grows more useful over days)")
     a = ap.parse_args()
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # token names often contain emoji
     db = {"wallets": {}, "positions": {}}
     if os.path.exists(a.wallets):
         try:
@@ -470,35 +512,41 @@ def main():
         with open(a.wallets, "w") as f:
             json.dump(db, f)
 
-    last_best = None
+    last = {}
     if a.state and os.path.exists(a.state):
-        last_best = open(a.state).read().strip() or None
-    if a.state and a.loop is None:
-        passed, rejected, s1 = scan(a.min_age, db)
-        save_db()
-        best = report(passed, rejected, s1)
-        if best and best["mint"] != last_best and best["score"] >= 60:
-            print("*** NEW BEST PICK ***")
-            if a.ntfy:
-                push(a.ntfy, best)
-        with open(a.state, "w") as f:
-            f.write(best["mint"] if best else "")
-        return
+        raw = open(a.state).read().strip()
+        try:
+            last = json.loads(raw) if raw else {}
+        except ValueError:
+            last = {"main": raw}  # older single-pick format
+
+    def alert(best):
+        """Alert once per new top pick in each tier; returns True if anything fired."""
+        fired = False
+        for tier, bar in (("main", ALERT_MAIN), ("early", ALERT_EARLY)):
+            b = best.get(tier)
+            if b and b["mint"] != last.get(tier) and b["score"] >= bar:
+                print(f"\a*** NEW {tier.upper()} PICK: {b['symbol']} ***")
+                if a.ntfy:
+                    push(a.ntfy, b)
+                fired = True
+            last[tier] = b["mint"] if b else None
+        return fired
+
     while True:
         passed, rejected, s1 = scan(a.min_age, db)
         save_db()
         best = report(passed, rejected, s1)
         print(f"\nsaved {save(passed, rejected)}")
+        fired = alert(best)
+        if a.state:
+            with open(a.state, "w") as f:
+                json.dump(last, f)
         if a.loop is None:
             break
-        if best and best["mint"] != last_best and best["score"] >= 60:
-            print("\a*** NEW BEST PICK ***")
-            if a.ntfy:
-                push(a.ntfy, best)
-            if sys.platform == "win32":
-                import winsound
-                winsound.Beep(880, 400); winsound.Beep(1320, 400)
-        last_best = best["mint"] if best else None
+        if fired and sys.platform == "win32":
+            import winsound
+            winsound.Beep(880, 400); winsound.Beep(1320, 400)
         print(f"next scan in {a.loop:g} min (Ctrl+C to stop)")
         time.sleep(a.loop * 60)
 
