@@ -40,10 +40,17 @@ LEARN_TOKENS = 12         # extra trending tokens per scan whose whale buyers ge
 SMART_WIN_X = 2.0         # a wallet "wins" if the token later trades at 2x its entry
 SMART_LOSS_X = 0.5        # ...and "loses" if it later trades at half its entry
 TRACK_DAYS = 7
+GT_GAP = 3.0             # seconds between GeckoTerminal calls
+
+
+_last_gt = [0.0]
 
 
 def get(url, tries=3):
     for i in range(tries):
+        if url.startswith(GT):  # GeckoTerminal free tier: stay under its rate limit
+            time.sleep(max(0.0, _last_gt[0] + GT_GAP - time.time()))
+            _last_gt[0] = time.time()
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"})
             with urllib.request.urlopen(req, timeout=25) as r:
@@ -70,12 +77,16 @@ def gather_candidates():
         for p in d.get("pairs") or []:
             if p.get("chainId") == "solana":
                 mints.add(p["baseToken"]["address"])
-    for path in [f"/trending_pools?page={i}" for i in (1, 2, 3)] + \
-                [f"/pools?sort=h24_volume_usd_desc&page={i}" for i in (1, 2, 3)]:
+    # Go well beyond the front page: trending over several windows, deep volume and
+    # transaction rankings, and freshly created pools, so quiet risers get caught too.
+    gt_paths = [f"/trending_pools?duration={d}&page={i}" for d in ("1h", "6h", "24h") for i in (1, 2)] + \
+               [f"/pools?sort=h24_volume_usd_desc&page={i}" for i in range(1, 6)] + \
+               [f"/pools?sort=h24_tx_count_desc&page={i}" for i in range(1, 4)] + \
+               [f"/new_pools?page={i}" for i in (1, 2)]
+    for path in gt_paths:
         d = get(GT + path) or {}
         for pool in d.get("data") or []:
             mints.add(pool["relationships"]["base_token"]["data"]["id"].removeprefix("solana_"))
-        time.sleep(2.2)
     return [m for m in mints if m not in SKIP_MINTS]
 
 
@@ -165,6 +176,9 @@ def safety(m):
     pools = set()
     for mk in r.get("markets") or []:
         pools.update({mk.get("pubkey"), mk.get("liquidityA"), mk.get("liquidityB")})
+    # program-owned accounts (AMMs like the Pump.fun AMM, lockers) aren't real holders
+    pools.update(a for a, k in (r.get("knownAccounts") or {}).items()
+                 if (k.get("type") or "").upper() in ("AMM", "LOCKER"))
     holders = [h for h in r.get("topHolders") or [] if h.get("owner") not in pools and h.get("address") not in pools]
     lp_locked = max([((mk.get("lp") or {}).get("lpLockedPct") or 0) for mk in r.get("markets") or []] or [0])
     risks = r.get("risks") or []
@@ -243,8 +257,8 @@ def learn(db, prices):
 
 def flow(m, db):
     """Wallet-level order flow: real unique buyers, whale accumulation, smart wallets."""
-    recent = trades(m["pair"]); time.sleep(2.2)
-    whales = trades(m["pair"], WHALE_USD); time.sleep(2.2)
+    recent = trades(m["pair"])
+    whales = trades(m["pair"], WHALE_USD)
     if not recent:
         return "no trade data"
     now = time.time()
@@ -347,7 +361,7 @@ def scan(min_age_h, db, verbose=True):
         (rejected.__setitem__(m["symbol"], why) if why else s1.append(m))
     log(f"  {len(s1)} passed liquidity/volume/bot/age filters; checking charts, safety, wallets...")
     for m in sorted(s1, key=lambda x: -x["vol_mc"])[:25]:
-        why = price_structure(m); time.sleep(2.2)
+        why = price_structure(m)
         if not why:
             why = safety(m); time.sleep(1)
         if not why:
@@ -364,7 +378,7 @@ def scan(min_age_h, db, verbose=True):
     learn_set = [m for m in all_m if m["mint"] not in done and m["liq"] >= 30_000 and m["mc"]
                  and m["avg_trade_24h"] >= MIN_AVG_TRADE and m["txns_24h"] >= MIN_TXNS_24H]
     for m in sorted(learn_set, key=lambda x: -x["vol_mc"])[:LEARN_TOKENS]:
-        record_entries(db, m["mint"], trades(m["pair"], WHALE_USD)); time.sleep(2.2)
+        record_entries(db, m["mint"], trades(m["pair"], WHALE_USD))
     learn(db, {m["mint"]: (m["price"], m["liq"]) for m in all_m})
     smart_n = sum(1 for r in db["wallets"].values() if is_smart(r))
     early_n = sum(1 for r in db["wallets"].values() if r["w"])
