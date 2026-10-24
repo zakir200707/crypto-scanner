@@ -1,0 +1,5 @@
+results/
+state.txt
+__pycache__/
+.claude/
+skills-lock.json

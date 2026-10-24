@@ -1,0 +1,36 @@
+name: scan
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: scan
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Restore last pick
+        uses: actions/cache/restore@v4
+        with:
+          path: state.txt
+          key: state-${{ github.run_id }}
+          restore-keys: state-
+      - name: Scan
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+        run: python scanner.py --state state.txt --ntfy "$NTFY_TOPIC"
+      - name: Save last pick
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: state.txt
+          key: state-${{ github.run_id }}
