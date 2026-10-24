@@ -14,7 +14,7 @@ Usage:
 Not financial advice. Data is a snapshot; most small-cap memecoins go to zero.
 """
 import argparse, json, os, sys, time, urllib.request
-from datetime import datetime
+from datetime import datetime, timezone
 
 DEX = "https://api.dexscreener.com"
 GT = "https://api.geckoterminal.com/api/v2/networks/solana"
@@ -42,6 +42,7 @@ EARLY_MIN_VOL_MC = 1.0
 EARLY_MIN_TXNS = 300
 ALERT_MAIN = 60
 ALERT_EARLY = 65          # higher bar because the tier is riskier
+REPORT_HOUR_UTC = 9       # daily "still alive" summary (9:00 UK winter time)
 
 # Smart money
 WHALE_USD = 300           # a "whale" trade on a sub-$5M memecoin
@@ -533,12 +534,41 @@ def main():
             last[tier] = b["mint"] if b else None
         return fired
 
+    def daily_report(best, fired):
+        """Track every run; once a day after REPORT_HOUR_UTC send a 'still alive' summary."""
+        st = last.setdefault("stats", {"runs": [], "best": {}, "alerts": 0, "reported": ""})
+        now = datetime.now(timezone.utc)
+        st["runs"] = [t for t in st["runs"] if t > now.timestamp() - 86400] + [now.timestamp()]
+        st["alerts"] += int(fired)
+        for tier, b in best.items():
+            if b["score"] > (st["best"].get(tier) or ["", -1])[1]:
+                st["best"][tier] = [b["symbol"], b["score"]]
+        today = now.strftime("%Y-%m-%d")
+        if now.hour < REPORT_HOUR_UTC or st["reported"] == today:
+            return
+        smart_n = sum(1 for r in db["wallets"].values() if is_smart(r))
+        lines = [f"{len(st['runs'])} scans in the last 24h, {st['alerts']} pick alert(s)."]
+        for tier, label in (("main", "Best main"), ("early", "Best early gem")):
+            sym, sc = st["best"].get(tier) or ("none passed", None)
+            lines.append(f"{label}: {sym}" + (f" (score {sc})" if sc is not None else ""))
+        lines.append(f"{smart_n} proven smart wallets tracked.")
+        print("DAILY REPORT\n" + "\n".join(lines))
+        if a.ntfy:
+            try:
+                req = urllib.request.Request(f"https://ntfy.sh/{a.ntfy}", data="\n".join(lines).encode(),
+                                             headers={"Title": "Scanner OK - daily report", "Priority": "low"})
+                urllib.request.urlopen(req, timeout=15)
+            except Exception as e:
+                print(f"push failed: {e}")
+        st.update(best={}, alerts=0, reported=today)
+
     while True:
         passed, rejected, s1 = scan(a.min_age, db)
         save_db()
         best = report(passed, rejected, s1)
         print(f"\nsaved {save(passed, rejected)}")
         fired = alert(best)
+        daily_report(best, fired)
         if a.state:
             with open(a.state, "w") as f:
                 json.dump(last, f)
