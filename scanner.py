@@ -13,8 +13,9 @@ Usage:
 
 Not financial advice. Data is a snapshot; most small-cap memecoins go to zero.
 """
-import argparse, json, os, sys, time, urllib.request
+import argparse, json, math, os, sys, time, urllib.request
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 DEX = "https://api.dexscreener.com"
 GT = "https://api.geckoterminal.com/api/v2/networks/solana"
@@ -421,6 +422,21 @@ def fmt_money(x):
     return f"${x/1e6:.2f}M" if x >= 1e6 else f"${x/1e3:.0f}K"
 
 
+def fmt_price(x):
+    """$0.0004461 style: plain decimals with 4 significant digits, no scientific notation."""
+    if x >= 1:
+        return f"${x:,.4f}"
+    digits = 4 - int(math.floor(math.log10(x))) - 1 if x > 0 else 4
+    return f"${x:.{digits}f}"
+
+
+def uk_now():
+    try:
+        return datetime.now(ZoneInfo("Europe/London")).strftime("%H:%M %d %b (UK)")
+    except Exception:  # no timezone database (e.g. bare Windows Python)
+        return datetime.now(timezone.utc).strftime("%H:%M %d %b (UTC)")
+
+
 def report(passed, rejected, s1):
     print("\n" + "=" * 78)
     if rejected:
@@ -477,6 +493,7 @@ def save(passed, rejected):
 def push(topic, b):
     """Phone alert via ntfy.sh (install the ntfy app and subscribe to the same topic)."""
     msg = (f"{b['name']} ({b['symbol']}) score {b['score']}\n"
+           f"Price {fmt_price(b['price'])} at {uk_now()}\n"
            f"MC {fmt_money(b['mc'])} | liq {fmt_money(b['liq'])} | {b['from_24h_high']:.0f}% off 24h high\n"
            f"Whales net 6h ${b['whale_net_6h']:,.0f} | accumulators {b['accumulators']} | "
            f"smart wallets {b['smart_buyers']}\n"
@@ -552,6 +569,7 @@ def main():
             sym, sc = st["best"].get(tier) or ("none passed", None)
             lines.append(f"{label}: {sym}" + (f" (score {sc})" if sc is not None else ""))
         lines.append(f"{smart_n} proven smart wallets tracked.")
+        lines.append(f"Sent {uk_now()}")
         print("DAILY REPORT\n" + "\n".join(lines))
         if a.ntfy:
             try:
