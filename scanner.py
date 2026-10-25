@@ -539,16 +539,20 @@ def main():
             last = {"main": raw}  # older single-pick format
 
     def alert(best):
-        """Alert once per new top pick in each tier; returns True if anything fired."""
+        """Alert on a tier's top pick at most once per coin per 24h; returns True if anything fired."""
         fired = False
+        now = time.time()
+        sent = {m: t for m, t in last.get("alerted", {}).items() if now - t < 86400}
         for tier, bar in (("main", ALERT_MAIN), ("early", ALERT_EARLY)):
             b = best.get(tier)
-            if b and b["mint"] != last.get(tier) and b["score"] >= bar:
+            if b and b["mint"] not in sent and b["score"] >= bar:
                 print(f"\a*** NEW {tier.upper()} PICK: {b['symbol']} ***")
                 if a.ntfy:
                     push(a.ntfy, b)
+                sent[b["mint"]] = now
                 fired = True
             last[tier] = b["mint"] if b else None
+        last["alerted"] = sent
         return fired
 
     def daily_report(best, fired):
