@@ -52,6 +52,16 @@ SMART_WIN_X = 2.0         # a wallet "wins" if the token later trades at 2x its 
 SMART_LOSS_X = 0.5        # ...and "loses" if it later trades at half its entry
 TRACK_DAYS = 7
 GT_GAP = 4.0             # seconds between GeckoTerminal calls
+DB_VERSION = 2            # bump to wipe wallet memory when grading rules change
+
+# Pre-pump detection
+MAX_RUNUP_MAIN = 300      # % above 24h low: beyond this the move already happened
+MAX_RUNUP_EARLY = 400
+RPC = "https://api.mainnet-beta.solana.com"
+TOKEN_PROGRAM = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+RADAR_WALLETS = 30        # smart wallets whose holdings get checked each scan
+RPC_GAP = 2.0             # public RPC throttles heavy calls hard
+BOT_ACCOUNTS = 300        # wallets holding this many tokens are sniper bots, not smart money
 
 
 _last_gt = [0.0]
@@ -74,6 +84,45 @@ def get(url, tries=3):
         except Exception:
             time.sleep(2)
     return None
+
+
+def rpc(method, params):
+    time.sleep(RPC_GAP)
+    body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}).encode()
+    req = urllib.request.Request(RPC, data=body, headers={"Content-Type": "application/json",
+                                                          "User-Agent": "Mozilla/5.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=25) as r:
+            return json.load(r).get("result")
+    except Exception:
+        return None
+
+
+def radar(db):
+    """Smart-wallet radar: diff each proven wallet's token holdings against last scan.
+    Coins they just picked up - before the coin trends - come back as {mint: n_wallets}."""
+    smart = sorted((w for w, r in db["wallets"].items() if is_smart(r)),
+                   key=lambda w: -db["wallets"][w]["w"])[:RADAR_WALLETS]
+    snaps, hits = db.setdefault("holdings", {}), {}
+    for w in smart:
+        res = rpc("getTokenAccountsByOwner", [w, {"programId": TOKEN_PROGRAM}, {"encoding": "jsonParsed"}])
+        if res is None:
+            continue
+        accts = res.get("value") or []
+        if len(accts) > BOT_ACCOUNTS:
+            db["wallets"][w]["bot"] = True
+            snaps.pop(w, None)
+            continue
+        held = {a["account"]["data"]["parsed"]["info"]["mint"] for a in accts
+                if float(a["account"]["data"]["parsed"]["info"]["tokenAmount"]["uiAmount"] or 0) > 0}
+        if w in snaps:
+            for mint in held - set(snaps[w]) - SKIP_MINTS:
+                hits[mint] = hits.get(mint, 0) + 1
+        snaps[w] = sorted(held)
+    for w in list(snaps):
+        if w not in smart:
+            del snaps[w]
+    return hits
 
 
 def gather_candidates():
@@ -185,10 +234,20 @@ def price_structure(m):
     lo6 = min(x[3] for x in c[-6 * per_h:])
     prev = c[-24 * per_h:-6 * per_h] or c[:-6 * per_h] or c[:1]
     lo_prev = min(x[3] for x in prev)
+    lo24 = min(x[3] for x in c[-24 * per_h:])
     m["from_24h_high"] = (px / hi24 - 1) * 100
     m["from_72h_high"] = (px / hi72 - 1) * 100
+    m["from_24h_low"] = (px / lo24 - 1) * 100 if lo24 else 0
     m["above_6h_low"] = (px / lo6 - 1) * 100
     m["higher_low"] = lo6 >= lo_prev
+    # Volume picking up while price hasn't moved yet = buying before the breakout
+    recent, prior = c[-2 * per_h:], c[-14 * per_h:-2 * per_h]
+    prior_avg = sum(x[5] for x in prior) / len(prior) if prior else 0
+    m["vol_accel"] = (sum(x[5] for x in recent) / len(recent)) / prior_avg if prior_avg else 0
+    m["pc_2h"] = (px / recent[0][1] - 1) * 100 if recent[0][1] else 0
+    max_run = MAX_RUNUP_EARLY if m.get("tier") == "early" else MAX_RUNUP_MAIN
+    if m["from_24h_low"] > max_run:
+        return f"already pumped +{m['from_24h_low']:.0f}% from 24h low"
     if m["from_72h_high"] > -5:
         return "at/near 72h high (top-buying risk)"
     if m["from_24h_high"] < -60:
@@ -245,15 +304,21 @@ def trades(pair, min_usd=0):
 
 
 def record_entries(db, mint, whale_trades):
-    """Remember each whale's first buy price so we can later tell if they were early."""
+    """Remember each whale's first buy price so we can later tell if they were early.
+    Wallets that sell within an hour of buying are flipping bots, not conviction buyers."""
     pos = db["positions"].setdefault(mint, {"t": time.time(), "entries": {}})
+    sells = {}
+    for t in whale_trades:
+        if not t["buy"]:
+            sells.setdefault(t["w"], []).append(t["ts"])
     for t in sorted(whale_trades, key=lambda x: x["ts"]):
-        if t["buy"] and t["price"] and t["w"] not in pos["entries"] and len(pos["entries"]) < 300:
+        flipped = any(0 <= s - t["ts"] <= 3600 for s in sells.get(t["w"], []))
+        if t["buy"] and t["price"] and not flipped and t["w"] not in pos["entries"] and len(pos["entries"]) < 300:
             pos["entries"][t["w"]] = t["price"]
 
 
 def is_smart(rec):
-    return rec["w"] >= 2 and rec["w"] >= rec["l"]
+    return rec["w"] >= 2 and rec["w"] >= rec["l"] and not rec.get("bot")
 
 
 def learn(db, prices):
@@ -339,12 +404,25 @@ def score(m):
     s += min(max(m["wallet_bs"] - 1, 0) / 0.8, 1) * 7
     if m["bs_5m"] >= m["bs_1h"] >= m["bs_6h"] >= 1:
         s += 5; why.append("buyer pressure rising 6h->1h->5m")
-    # Entry: pullback depth (15)
+    # Entry (15): early in the move beats a dip after a huge run
     dd = -m["from_24h_high"]
     if 20 <= dd <= 40:
-        s += 15; why.append(f"{dd:.0f}% pullback (in 20-40% zone)")
+        s += 7; why.append(f"{dd:.0f}% pullback (in 20-40% zone)")
     elif 12 <= dd < 20 or 40 < dd <= 50:
-        s += 7
+        s += 3
+    run = m["from_24h_low"]
+    if run < 60:
+        s += 8; why.append(f"only +{run:.0f}% from 24h low (early)")
+    elif run < 120:
+        s += 4
+    elif run > 200:
+        s -= 5
+    # Pre-pump (8 + 16): quiet accumulation and smart-wallet radar
+    if m["vol_accel"] >= 1.5 and abs(m["pc_2h"]) < 15:
+        s += 8; why.append(f"volume {m['vol_accel']:.1f}x prior hours while price flat (quiet accumulation)")
+    if m.get("radar"):
+        s += min(m["radar"], 2) * 8
+        why.append(f"{m['radar']} smart wallet(s) just bought (radar)")
     # Floor holding (10)
     if m["higher_low"]:
         s += 6; why.append("higher low vs prior 18h")
@@ -378,19 +456,25 @@ def score(m):
 
 def scan(min_age_h, db, verbose=True):
     log = print if verbose else (lambda *a, **k: None)
-    log(f"[{datetime.now():%H:%M:%S}] gathering candidates...")
-    mints = gather_candidates()
+    log(f"[{datetime.now():%H:%M:%S}] checking smart-wallet radar...")
+    hits = radar(db)
+    log(f"  radar: {len(hits)} coins newly bought by smart wallets")
+    log("  gathering candidates...")
+    mints = list(set(gather_candidates()) | set(hits))
     pairs = best_pairs(mints)
     log(f"  {len(mints)} tokens, {len(pairs)} with Solana pairs")
     passed, rejected = [], {}
     s1, all_m = [], []
     for p in pairs:
         m, why = stage1(p, min_age_h)
+        m["radar"] = hits.get(m["mint"], 0)
         all_m.append(m)
         (rejected.__setitem__(m["mint"], (m["symbol"], why)) if why else s1.append(m))
     log(f"  {len(s1)} passed liquidity/volume/bot/age filters; checking charts, safety, wallets...")
-    main = sorted([m for m in s1 if m["tier"] == "main"], key=lambda x: -x["vol_mc"])[:10]
-    early = sorted([m for m in s1 if m["tier"] == "early"], key=lambda x: -x["vol_mc"])[:8]
+    # Radar coins always get a deep check; otherwise the most active per tier
+    by_rank = sorted(s1, key=lambda x: (-x["radar"], -x["vol_mc"]))
+    main = [m for m in by_rank if m["tier"] == "main"][:10]
+    early = [m for m in by_rank if m["tier"] == "early"][:8]
     for m in main + early:
         why = price_structure(m)
         if not why:
@@ -472,6 +556,8 @@ def describe(passed, bar):
     print(f"  wallets: {b['uniq_buyers']} buyers vs {b['uniq_sellers']} sellers (last 300 trades) | "
           f"whale net 6h ${b['whale_net_6h']:,.0f}, 24h ${b['whale_net_24h']:,.0f} | "
           f"accumulators {b['accumulators']} | smart wallets {b['smart_buyers']}")
+    print(f"  pre-pump: +{b['from_24h_low']:.0f}% from 24h low | volume {b['vol_accel']:.1f}x prior hours, "
+          f"price {b['pc_2h']:+.0f}% in 2h | radar {b['radar']}")
     if b["why"]:
         print("  + " + "; ".join(b["why"]))
     if b["risks"]:
@@ -495,6 +581,8 @@ def push(topic, b):
     msg = (f"{b['name']} ({b['symbol']}) score {b['score']}\n"
            f"Price {fmt_price(b['price'])} at {uk_now()}\n"
            f"MC {fmt_money(b['mc'])} | liq {fmt_money(b['liq'])} | {b['from_24h_high']:.0f}% off 24h high\n"
+           f"Up {b['from_24h_low']:.0f}% from 24h low | volume {b['vol_accel']:.1f}x | "
+           f"radar {b['radar']} smart wallet(s)\n"
            f"Whales net 6h ${b['whale_net_6h']:,.0f} | accumulators {b['accumulators']} | "
            f"smart wallets {b['smart_buyers']}\n"
            f"{'; '.join(b['risks']) or 'no rugcheck warnings'}\n{b['url']}")
@@ -518,10 +606,12 @@ def main():
                     help="smart-wallet memory file (grows more useful over days)")
     a = ap.parse_args()
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # token names often contain emoji
-    db = {"wallets": {}, "positions": {}}
+    db = {"version": DB_VERSION, "wallets": {}, "positions": {}, "holdings": {}}
     if os.path.exists(a.wallets):
         try:
-            db.update(json.load(open(a.wallets)))
+            saved = json.load(open(a.wallets))
+            if saved.get("version") == DB_VERSION:  # older memory was polluted by flipping bots
+                db.update(saved)
         except ValueError:
             pass
 
