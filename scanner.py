@@ -57,6 +57,10 @@ DB_VERSION = 2            # bump to wipe wallet memory when grading rules change
 # Pre-pump detection
 MAX_RUNUP_MAIN = 300      # % above 24h low: beyond this the move already happened
 MAX_RUNUP_EARLY = 400
+MAX_PUMP_1H = 25          # % up in the last hour: the pump is already under way, an alert would be late
+MAX_DRIFT = 10            # % the price may move while the scan runs before the alert is dropped
+MAX_WHALE_EXIT = 0.2      # whales net selling more than this share of liquidity in 6h: reject
+BUY_LIMIT = 1.10          # alerts say "don't buy above" this multiple of the alert price
 RPC = "https://api.mainnet-beta.solana.com"
 TOKEN_PROGRAM = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
 RADAR_WALLETS = 30        # smart wallets whose holdings get checked each scan
@@ -198,6 +202,8 @@ def stage1(p, min_age_h):
         return m, f"avg trade ${min(m['avg_trade_24h'], m['avg_trade_1h']):.0f} (bot volume)"
     if m["bs_1h"] < 1.0 or m["bs_6h"] < 1.0:
         return m, "sellers dominate"
+    if (m["pc_1h"] or 0) > MAX_PUMP_1H:
+        return m, f"already up {m['pc_1h']:.0f}% in the last hour (alert would be late)"
     if liq >= MIN_LIQ and age_h >= min_age_h:
         m["tier"] = "main"
         if n24 < MIN_TXNS_24H:
@@ -245,6 +251,8 @@ def price_structure(m):
     prior_avg = sum(x[5] for x in prior) / len(prior) if prior else 0
     m["vol_accel"] = (sum(x[5] for x in recent) / len(recent)) / prior_avg if prior_avg else 0
     m["pc_2h"] = (px / recent[0][1] - 1) * 100 if recent[0][1] else 0
+    if m["vol_accel"] >= 5 and m["pc_2h"] > 15:
+        return f"pump in progress (volume {m['vol_accel']:.0f}x, price +{m['pc_2h']:.0f}% in 2h)"
     max_run = MAX_RUNUP_EARLY if m.get("tier") == "early" else MAX_RUNUP_MAIN
     if m["from_24h_low"] > max_run:
         return f"already pumped +{m['from_24h_low']:.0f}% from 24h low"
@@ -385,6 +393,8 @@ def flow(m, db):
     m["smart_wallets"] = smart[:5]
     record_entries(db, m["mint"], whales)
 
+    if m["whale_net_6h"] < -MAX_WHALE_EXIT * m["liq"]:
+        return f"whales net sold ${-m['whale_net_6h']:,.0f} in 6h ({-m['whale_net_6h'] / m['liq']:.0%} of liquidity)"
     if ws24 > 2 * wb24 and ws24 > 2000:
         return f"whales dumping (${ws24:,.0f} sold vs ${wb24:,.0f} bought, 24h)"
     if m["top_buyer_share"] > 0.4 and len(buyers) > 5:
@@ -576,10 +586,29 @@ def save(passed, rejected):
     return path
 
 
+def refresh(b):
+    """Re-read the price right before alerting: the scan takes minutes and memecoins move fast.
+    Returns a reason to skip the alert, or None (and updates price/MC to the fresh values)."""
+    p = ((get(f"{DEX}/latest/dex/pairs/solana/{b['pair']}") or {}).get("pairs") or [None])[0]
+    if not p or not b["price"]:
+        return "could not re-check the price"
+    px = float(p.get("priceUsd") or 0)
+    drift = (px / b["price"] - 1) * 100
+    h1 = (p.get("priceChange") or {}).get("h1") or 0
+    if drift > MAX_DRIFT:
+        return f"price moved +{drift:.0f}% while scanning"
+    if h1 > MAX_PUMP_1H:
+        return f"up {h1:.0f}% in the last hour"
+    b["price"], b["mc"] = px, p.get("marketCap") or b["mc"]
+    return None
+
+
 def push(topic, b):
     """Phone alert via ntfy.sh (install the ntfy app and subscribe to the same topic)."""
     msg = (f"{b['name']} ({b['symbol']}) score {b['score']}\n"
            f"Price {fmt_price(b['price'])} at {uk_now()}\n"
+           f"DON'T BUY ABOVE {fmt_price(b['price'] * BUY_LIMIT)} - if it's higher you're late, skip it.\n"
+           f"Plan: stop {fmt_price(b['price'] * 0.75)} (-25%), sell half at {fmt_price(b['price'] * 1.5)} (+50%). Max $10.\n"
            f"MC {fmt_money(b['mc'])} | liq {fmt_money(b['liq'])} | {b['from_24h_high']:.0f}% off 24h high\n"
            f"Up {b['from_24h_low']:.0f}% from 24h low | volume {b['vol_accel']:.1f}x | "
            f"radar {b['radar']} smart wallet(s)\n"
@@ -635,7 +664,10 @@ def main():
         sent = {m: t for m, t in last.get("alerted", {}).items() if now - t < 86400}
         for tier, bar in (("main", ALERT_MAIN), ("early", ALERT_EARLY)):
             b = best.get(tier)
-            if b and b["mint"] not in sent and b["score"] >= bar:
+            skip = b and b["mint"] not in sent and b["score"] >= bar and refresh(b)
+            if skip:
+                print(f"not alerting {b['symbol']}: {skip}")
+            elif b and b["mint"] not in sent and b["score"] >= bar:
                 print(f"\a*** NEW {tier.upper()} PICK: {b['symbol']} ***")
                 if a.ntfy:
                     push(a.ntfy, b)
