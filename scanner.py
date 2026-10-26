@@ -672,10 +672,50 @@ def main():
                 if a.ntfy:
                     push(a.ntfy, b)
                 sent[b["mint"]] = now
+                last.setdefault("open", {})[b["mint"]] = {"sym": b["symbol"], "pair": b["pair"], "price": b["price"],
+                                                          "t": now, "stage": 0, "url": b["url"]}
                 fired = True
             last[tier] = b["mint"] if b else None
         last["alerted"] = sent
         return fired
+
+    def follow_up():
+        """Follow each alerted coin and say when its plan says to sell: half at +50% (then the rest
+        at +100% or back at the buy price), everything at -25%, or a reminder after 72h."""
+        now = time.time()
+        for mint, o in list(last.get("open", {}).items()):
+            p = ((get(f"{DEX}/latest/dex/pairs/solana/{o['pair']}") or {}).get("pairs") or [None])[0]
+            px = float((p or {}).get("priceUsd") or 0)
+            if not px:
+                continue
+            r = px / o["price"]
+            msg, close = None, True
+            if o["stage"] == 0 and r >= 1.5:
+                msg, o["stage"] = (f"TARGET HIT +{(r - 1) * 100:.0f}%: sell HALF now. Keep the rest, and sell it at "
+                                   f"{fmt_price(o['price'] * 2)} (+100%) or if it falls back to your buy price "
+                                   f"{fmt_price(o['price'])}."), 1
+                close = False
+            elif o["stage"] == 0 and r <= 0.75:
+                msg = f"STOP HIT {(r - 1) * 100:.0f}%: sell now. Small loss is the plan working."
+            elif o["stage"] == 1 and r >= 2:
+                msg = f"+{(r - 1) * 100:.0f}%: sell the REST now."
+            elif o["stage"] == 1 and r <= 1.0:
+                msg = "Back to your buy price: sell the rest now (you already locked in profit on the first half)."
+            elif now - o["t"] > 72 * 3600:
+                msg = f"72h since the alert, now {(r - 1) * 100:+.0f}%. If you still hold it, sell."
+            if msg:
+                print(f"follow-up {o['sym']}: {msg}")
+                if a.ntfy:
+                    try:
+                        body = f"{o['sym']}: {msg}\nAlert price {fmt_price(o['price'])}, now {fmt_price(px)} at {uk_now()}\n{o['url']}"
+                        req = urllib.request.Request(f"https://ntfy.sh/{a.ntfy}", data=body.encode(),
+                                                     headers={"Title": f"SELL SIGNAL: {o['sym']}".encode("ascii", "ignore").decode(),
+                                                              "Priority": "high", "Click": o["url"] or ""})
+                        urllib.request.urlopen(req, timeout=15)
+                    except Exception as e:
+                        print(f"push failed: {e}")
+                if close:
+                    del last["open"][mint]
 
     def daily_report(best, fired):
         """Track every run; once a day after REPORT_HOUR_UTC send a 'still alive' summary."""
@@ -711,6 +751,7 @@ def main():
         save_db()
         best = report(passed, rejected, s1)
         print(f"\nsaved {save(passed, rejected)}")
+        follow_up()
         fired = alert(best)
         daily_report(best, fired)
         if a.state:
