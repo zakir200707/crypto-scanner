@@ -1,0 +1,32 @@
+name: research-collect
+
+# One-off data collection for research (not part of the alert system): downloads 5-minute
+# price history for the graduated coins listed in an index file and uploads it as an artifact.
+on:
+  workflow_dispatch:
+    inputs:
+      index:
+        description: "Index file (in research/data)"
+        default: "research/data/grad_index_1.json"
+
+permissions:
+  contents: read
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Download candles
+        timeout-minutes: 340
+        run: python research/collect_grads.py --index "${{ inputs.index }}" --out grads --max 100000
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: grads
+          path: grads
+          retention-days: 7
