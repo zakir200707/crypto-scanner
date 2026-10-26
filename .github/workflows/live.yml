@@ -1,0 +1,58 @@
+name: live
+
+# Launch watcher: runs continuously in ~5.6h jobs (GitHub's limit is 6h). Each job queues
+# the next one when it ends; the 3-hourly cron is a backup. Disable the workflow to stop.
+on:
+  schedule:
+    - cron: "17 */3 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: live
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install websockets==16.0
+      - name: Restore history
+        uses: actions/cache/restore@v4
+        with:
+          path: state
+          key: live-${{ github.run_id }}
+          restore-keys: live-
+      - name: Watch
+        timeout-minutes: 345
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+        run: |
+          mkdir -p state
+          python live.py --state state --ntfy "$NTFY_TOPIC" --hours 5.6
+      - name: Save history
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: state
+          key: live-${{ github.run_id }}
+      - name: Queue next run
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          waiting=$(gh run list -R "$GITHUB_REPOSITORY" -w live.yml --limit 20 --json status \
+            -q '[.[] | select(.status=="queued" or .status=="pending" or .status=="waiting")] | length')
+          if [ "$waiting" = "0" ]; then
+            gh workflow run live.yml -R "$GITHUB_REPOSITORY" --ref main
+          else
+            echo "a run is already queued; not chaining"
+          fi
