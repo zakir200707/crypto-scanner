@@ -206,6 +206,7 @@ class Watcher:
         if self.state_path and os.path.exists(self.state_path):
             self.state.update(json.load(open(self.state_path, encoding="utf-8")))
         self.last_test = 0
+        self.created = 0  # new-coin events heard this run
 
     def save(self):
         if self.state_path:
@@ -230,6 +231,7 @@ class Watcher:
             return
         now = time.time()
         if m.get("txType") == "create":
+            self.created += 1
             self.coins.setdefault(mint, {"born": now, "sym": m.get("symbol"), "dev_sol": m.get("solAmount") or 0,
                                          "grad": None, "logged": False, "hist": []})
         elif m.get("txType") == "migrate" or m.get("pool") in ("pump-amm", "raydium"):
@@ -386,8 +388,11 @@ async def run(args):
     w = Watcher(args)
     end = time.time() + args.hours * 3600
     task = asyncio.create_task(listen(w))
+    started = time.time()
     while time.time() < end:
         t = time.time()
+        if not w.created and t - started > 600:
+            sys.exit("no new coins from the PumpPortal feed in 10 min - feed blocked or down")
         await asyncio.to_thread(w.sweep)
         print(time.strftime("%H:%M:%S"), "watching", len(w.coins), "open", len(w.state["open"]), flush=True)
         await asyncio.sleep(max(1, POLL - (time.time() - t)))
