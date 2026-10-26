@@ -32,6 +32,8 @@ EXITS = {
     "TP200/SL50/48h": ("fixed", 2.0, 0.5, 48),
     "trail30/48h": ("trail", None, 0.3, 48),
     "trail50/72h": ("trail", None, 0.5, 72),
+    "hold72h (no stop)": ("fixed", 1e9, 1.0, 72),               # "spray and pray": let rare runners pay
+    "ladder: 1/2 at 2x, 1/2 at 10x / 72h": ("ladder", None, None, 72),
 }
 
 
@@ -48,6 +50,9 @@ def load(path="results/grads"):
         t, o, h, l, cl, v = c.T
         keep = t >= d["grad"] - 300
         t, o, h, l, cl, v = t[keep], o[keep], h[keep], l[keep], cl[keep], v[keep]
+        # a 5-minute wick more than 5x beyond the candle body is bad data or a sandwich, not a fill we'd get
+        h = np.minimum(h, np.maximum(o, cl) * 5)
+        l = np.maximum(l, np.minimum(o, cl) / 5)
         if len(t) < 3:
             coins.append({"mint": d["mint"], "grad": d["grad"], "n": len(t)})
             continue
@@ -115,6 +120,16 @@ def simulate(x, i, exit_spec):
         if a <= b:  # stop first (also when both in the same candle)
             return min(o[a], e * (1 - sl)) / e - 1 - COST
         return tp - COST  # take-profit order fills at the target (gaps above it are not counted)
+    if kind == "ladder":  # sell half at 2x, the other half at 10x, the rest at the time limit
+        got, left = 0.0, 1.0
+        for target in (2.0, 10.0):
+            hit = np.nonzero(h >= e * target)[0]
+            if len(hit):
+                got += 0.5 * target
+                left -= 0.5
+            else:
+                break
+        return got + left * c[-1] / e - 1 - COST
     # trailing stop: stop level = (max high seen BEFORE this candle, starting at entry) * (1 - sl)
     peak = np.maximum.accumulate(np.concatenate([[e], h[:-1]]))
     peak = np.maximum(peak, e)
@@ -128,14 +143,19 @@ def simulate(x, i, exit_spec):
 
 # ---------------------------------------------------------------- entry rules
 
+MIN_ENTRY_MC = 1e4  # below this the pool is dead or the price data is garbage (fake 1000x moves)
+
+
 def first(mask, x, min_age=0.0):
-    ok = mask & (x["age"] >= min_age)
+    ok = mask & (x["age"] >= min_age) & (x["mc"] >= MIN_ENTRY_MC)
     nz = np.nonzero(ok)[0]
     return nz[0] if len(nz) else None
 
 
 def build_rules():
     R = {}
+    for A in (0.05, 0.5, 2, 6):  # "spray and pray" entries: every coin, at a fixed age after graduation
+        R[f"every coin at age>={A}h"] = (lambda x, A=A: first(np.ones(x["n"], bool), x, A))
     for A in (1, 3, 6, 12, 24):
         for M in (5e4, 1e5, 2e5, 5e5, 1e6):
             R[f"survivor age>={A}h mc>={M/1e3:.0f}K"] = (lambda x, A=A, M=M: first(x["mc"] >= M, x, A))
@@ -178,7 +198,7 @@ def random_baseline(coins, exit_spec, reps=3, seed=7):
         for x in coins:
             if x["n"] < 3:
                 continue
-            cand = np.nonzero((x["age"] >= 0.5) & (x["age"] <= 48))[0]
+            cand = np.nonzero((x["age"] >= 0.5) & (x["age"] <= 48) & (x["mc"] >= MIN_ENTRY_MC))[0]
             if len(cand):
                 r = simulate(x, int(rnd.choice(cand)), exit_spec)
                 if r is not None:
@@ -213,7 +233,7 @@ def boot_ci(a, reps=2000, seed=3):
 
 def main():
     sys.stdout.reconfigure(encoding="utf-8")
-    coins = load()
+    coins = load(sys.argv[1] if len(sys.argv) > 1 else "results/grads")
     live = [x for x in coins if x["n"] >= 3]
     print(f"{len(coins)} coins, {len(live)} with 3+ candles after graduation")
     half = len(coins) // 2
@@ -224,6 +244,15 @@ def main():
     for en, spec in EXITS.items():
         print(f"  {en:16s} train {stats(random_baseline(train, spec))} | test {stats(random_baseline(test, spec))}")
     tr = evaluate(train, rules)
+    spray = {k: v for k, v in rules.items() if k.startswith("every coin")}
+    te_s = evaluate(test, spray)
+    print("\nSPRAY AND PRAY (buy every coin, tiny size) - heavy tails, so look at the CI")
+    for k in sorted(te_s):
+        if k[1] in ("hold72h (no stop)", "ladder: 1/2 at 2x, 1/2 at 10x / 72h", "trail50/72h"):
+            a, b = tr[k], te_s[k]
+            lo, hi = boot_ci(b)
+            print(f"  {k[0]:22s} {k[1]:36s} TRAIN {stats(a)} 10x+={np.mean(a >= 9):.3f}\n"
+                  f"  {'':59s} TEST  {stats(b)} 10x+={np.mean(b >= 9):.3f} 95%CI [{lo:+.3f},{hi:+.3f}]")
     ranked = sorted((k for k in tr if len(tr[k]) >= 40), key=lambda k: -tr[k].mean())
     print("\nTOP 25 ON TRAIN (n>=40) -> SAME RULE ON TEST")
     te = evaluate(test, {k[0]: rules[k[0]] for k in ranked[:25]})

@@ -10,6 +10,7 @@ import os
 import sys
 import threading
 import time
+import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
@@ -31,17 +32,22 @@ def _wait():
     time.sleep(max(0, t - time.time()))
 
 
-def rpc(method, params, tries=8):
+def rpc(method, params, tries=5):
     body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}).encode()
     for i in range(tries):
         _wait()
         try:
             req = urllib.request.Request(RPC, data=body, headers={"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"})
-            r = json.load(urllib.request.urlopen(req, timeout=40))
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                r = json.load(resp)
             if "result" in r:
                 return r["result"]
+        except urllib.error.HTTPError as e:
+            if e.code == 429:
+                with _lock:  # back off for everyone
+                    _next[0] = max(_next[0], time.time() + 5 * (i + 1))
         except Exception:
-            time.sleep(3 * (i + 1))
+            time.sleep(1 + i)
     return None
 
 
@@ -67,16 +73,34 @@ def main():
         if page[-1]["blockTime"] < start:
             break
     print(f"{len(sigs)} older migration transactions", flush=True)
-    new = {}
-    fetch = lambda s: rpc("getTransaction", [s["signature"], {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 1}])
+    cache_path = "results/grads/_extend_cache.json"  # signature -> mint (or "") so restarts resume
+    cache = json.load(open(cache_path)) if os.path.exists(cache_path) else {}
+
+    def mint_of(s):
+        tx = rpc("getTransaction", [s["signature"], {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 1}])
+        if tx is None:
+            return None
+        for b in tx.get("meta", {}).get("postTokenBalances") or []:
+            if b["mint"].endswith("pump"):
+                return b["mint"]
+        return ""
+
+    todo = [s for s in sigs if s["signature"] not in cache]
+    print(f"{len(sigs) - len(todo)} already cached, {len(todo)} to fetch", flush=True)
     with ThreadPoolExecutor(4) as ex:
-        txs = ex.map(fetch, sigs)
-    for i, (s, tx) in enumerate(zip(sigs, txs)):
-        for b in (tx or {}).get("meta", {}).get("postTokenBalances") or []:
-            if b["mint"].endswith("pump") and b["mint"] not in index:
-                new[b["mint"]] = min(new.get(b["mint"], 1e12), s["blockTime"])
-        if (i + 1) % 250 == 0:
-            print(f"  {i+1}/{len(sigs)} transactions, {len(new)} new coins", flush=True)
+        for k in range(0, len(todo), 200):
+            chunk = todo[k:k + 200]
+            for s, m in zip(chunk, ex.map(mint_of, chunk)):
+                if m is not None:
+                    cache[s["signature"]] = m
+            json.dump(cache, open(cache_path, "w"))
+            print(f"  {min(k + 200, len(todo))}/{len(todo)} fetched", flush=True)
+    new = {}
+    for s in sigs:
+        m = cache.get(s["signature"])
+        if m and m not in index:
+            new[m] = min(new.get(m, 1e12), s["blockTime"])
+    print(f"{len(new)} new coins", flush=True)
     mints = list(new)
     for i in range(0, len(mints), 30):
         pairs = insiders.get(DEX + ",".join(mints[i:i + 30])) or []

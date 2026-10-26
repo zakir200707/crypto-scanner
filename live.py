@@ -43,8 +43,17 @@ RETEST = 3600         # seconds between backtests
 COST = 0.03           # round-trip fees + slippage
 MIN_COINS = 25        # a rule needs this many past trades before it may alert
 MIN_AVG = 0.05        # ... and this average return per trade
+GRAD_RULE = "Survived graduation (5+ min after, MC $10K+), 30% trailing stop, max 48h"
+GRAD_WAIT = 300       # seconds after graduation before a coin counts as having survived the first dump
+GRAD_MIN_MC = 1e4
+GRAD_TRAIL = 0.3
+GRAD_TRACK_H = 48     # graduated coins that stay alive are followed this long ...
+GRAD_SLOW_AFTER = 4 * 3600
+SLOW_POLL = 300       # ... and polled every 5 min after their first 4 hours
+GRAD_MIN_COINS = 150  # high-variance setup (most trades lose ~30%), so it needs more trades to prove itself
 REPORT_HOUR_UTC = 9
 UA = {"User-Agent": "Mozilla/5.0"}
+LOG_VERSION = 2       # v2: graduated coins are priced from their graduated pool (v1 could read the frozen curve)
 
 # Candidate rules: market-cap band x buys in last 5 min x exit plan. All require the
 # market cap to have grown 20%+ in the last ~2.5 min (momentum just starting).
@@ -158,6 +167,45 @@ def trade(h, i, tp, sl, hold, last_t):
     return (fut[-1]["price"] / entry if fut else 0.3) - 1 - COST
 
 
+def grad_trades(coins, last_t):
+    """Graduation survivors: buy at the snapshot after the first one taken 5+ min after graduation
+    with MC $10K+, then sell on a 30% drop from the best price since entry (max 48h)."""
+    res = []
+    for h in coins.values():
+        g = max((r.get("grad") or 0) for r in h)
+        if not g or min(r.get("v", 1) for r in h) < 2:
+            continue  # older logs may hold frozen curve prices after graduation
+        for i, s in enumerate(h[:-1]):
+            if s["t"] < g + GRAD_WAIT or s["mc"] < GRAD_MIN_MC or s["price"] <= 0:
+                continue
+            e = h[i + 1]
+            if e["price"] <= 0:
+                break
+            peak, out = e["price"], None
+            for x in h[i + 2:]:
+                if x["t"] > e["t"] + GRAD_TRACK_H * 3600:
+                    break
+                if x["price"] <= peak * (1 - GRAD_TRAIL):
+                    out = x["price"] / e["price"]
+                    break
+                peak = max(peak, x["price"])
+            if out is None:
+                if h[-1]["t"] >= last_t - 900 and h[-1]["t"] < e["t"] + GRAD_TRACK_H * 3600:
+                    break  # still being followed and the stop has not hit: no result yet
+                out = h[-1]["price"] / e["price"]  # held 48h, or the coin died and was dropped
+            res.append((s["t"], out - 1 - COST))
+            break
+    return res
+
+
+def summarize(res):
+    res.sort()
+    rets = [r for _, r in res]
+    half = len(rets) // 2
+    return {"n": len(rets), "avg": statistics.mean(rets), "win": sum(r > 0 for r in rets) / len(rets),
+            "old": statistics.mean(rets[:half]) if half else 0, "new": statistics.mean(rets[half:])}
+
+
 def backtest(coins):
     if not coins:
         return {}
@@ -173,21 +221,18 @@ def backtest(coins):
                     if r is not None:
                         res.append((s["t"], r))
                     break
-        if not res:
-            continue
-        res.sort()
-        rets = [r for _, r in res]
-        half = len(rets) // 2
-        stats[name] = {
-            "n": len(rets), "avg": statistics.mean(rets), "win": sum(r > 0 for r in rets) / len(rets),
-            "old": statistics.mean(rets[:half]) if half else 0, "new": statistics.mean(rets[half:]),
-        }
+        if res:
+            stats[name] = summarize(res)
+    res = grad_trades(coins, last_t)
+    if res:
+        stats[GRAD_RULE] = summarize(res)
     return stats
 
 
 def live_rules(stats):
     good = {k: v for k, v in stats.items()
-            if v["n"] >= MIN_COINS and v["avg"] >= MIN_AVG and v["old"] > 0 and v["new"] > 0}
+            if v["n"] >= (GRAD_MIN_COINS if k == GRAD_RULE else MIN_COINS)
+            and v["avg"] >= MIN_AVG and v["old"] > 0 and v["new"] > 0}
     return dict(sorted(good.items(), key=lambda kv: -kv[1]["avg"]))
 
 
@@ -207,6 +252,9 @@ class Watcher:
             self.state.update(json.load(open(self.state_path, encoding="utf-8")))
         self.last_test = 0
         self.created = 0  # new-coin events heard this run
+        for mint, o in self.state["open"].items():  # keep following positions opened by an earlier run
+            self.coins[mint] = {"born": None, "sym": o["sym"], "dev_sol": 0, "grad": o.get("grad") or o["t"],
+                                "logged": True, "hist": [], "added": time.time(), "grad_seen": True}
 
     def save(self):
         if self.state_path:
@@ -246,9 +294,14 @@ class Watcher:
             last = c["hist"][-1] if c["hist"] else None
             if mint in self.state["open"]:
                 continue
-            if now - start > TRACK_H * 3600 or (now - start > DEAD_AFTER and (not last or last["mc"] < DEAD_MC) and not c["grad"]):
+            if c["grad"]:  # graduated: follow survivors for up to 48h, drop the ones that died
+                if now - c["grad"] > GRAD_TRACK_H * 3600 or (now - c["grad"] > 1800 and (not last or last["mc"] < DEAD_MC)):
+                    del self.coins[mint]
+            elif now - start > TRACK_H * 3600 or (now - start > DEAD_AFTER and (not last or last["mc"] < DEAD_MC)):
                 del self.coins[mint]
-        mints = list(self.coins)
+        mints = [m for m, c in self.coins.items()
+                 if m in self.state["open"] or not c["grad"] or now - c["grad"] < GRAD_SLOW_AFTER
+                 or not c["hist"] or now - c["hist"][-1]["t"] >= SLOW_POLL - 15]
         for i in range(0, len(mints), 30):
             try:
                 pairs = get(DEX + ",".join(mints[i:i + 30]))
@@ -258,9 +311,15 @@ class Watcher:
             best = {}
             for p in pairs:
                 a = p["baseToken"]["address"]
-                if a in self.coins and ((p.get("volume") or {}).get("h1") or 0) >= ((best.get(a) or {}).get("volume") or {}).get("h1", -1):
-                    best[a] = p
-            for a, p in best.items():
+                if a not in self.coins:
+                    continue
+                # After graduation the Pump.fun curve pair is frozen at the graduation price, so the
+                # graduated pool (PumpSwap/Raydium) always wins; then the deepest, most traded pair.
+                key = (p.get("dexId") != "pumpfun", (p.get("liquidity") or {}).get("usd") or 0,
+                       (p.get("volume") or {}).get("h1") or 0)
+                if a not in best or key > best[a][0]:
+                    best[a] = (key, p)
+            for a, (_, p) in best.items():
                 c = self.coins[a]
                 s = snapshot(p)
                 s["t"] = round(now)
@@ -273,7 +332,7 @@ class Watcher:
                 if self.log and c["logged"]:
                     row = {k: v for k, v in s.items() if k not in ("url", "g2")}
                     self.log.write(json.dumps({"mint": a, "sym": c["sym"], "born": c["born"], "grad": c["grad"],
-                                               "dev_sol": c["dev_sol"], **row}) + "\n")
+                                               "dev_sol": c["dev_sol"], "v": LOG_VERSION, **row}) + "\n")
                 self.check(a, c, s)
         if self.log:
             self.log.flush()
@@ -288,7 +347,15 @@ class Watcher:
     def check(self, mint, c, s):
         if not self.args.state or mint in self.state["alerted"]:
             return
+        if (c["grad"] and not c.get("grad_seen") and s["t"] >= c["grad"] + GRAD_WAIT
+                and s["mc"] >= GRAD_MIN_MC and s["price"] > 0):
+            c["grad_seen"] = True  # only the first qualifying moment counts, exactly as in the backtest
+            if GRAD_RULE in self.state["live"]:
+                self.alert_survivor(mint, c, s, self.state["live"][GRAD_RULE])
+                return
         for name, st in self.state["live"].items():
+            if name == GRAD_RULE:
+                continue
             rule = RULES.get(name)
             if rule and matches(rule, s):
                 tp, sl, hold = rule[4:]
@@ -307,19 +374,43 @@ class Watcher:
                 self.push(f"LAUNCH ALERT: {c['sym']}", body, s["url"] or "", "high")
                 return
 
+    def alert_survivor(self, mint, c, s, st):
+        self.state["alerted"][mint] = s["t"]
+        self.state["open"][mint] = {"sym": c["sym"], "rule": GRAD_RULE, "entry": s["price"], "t": s["t"],
+                                    "kind": "trail", "trail": GRAD_TRAIL, "peak": s["price"], "grad": c["grad"],
+                                    "hold": GRAD_TRACK_H * 3600, "url": s["url"]}
+        body = (f"{c.get('name') or c['sym']} ({c['sym']}) graduated {(s['t'] - c['grad']) / 60:.0f} min ago "
+                f"and survived the first dump\n"
+                f"Price {fmt_price(s['price'])} at {uk_now()} | MC {fmt_money(s['mc'])}\n"
+                f"PLAN: buy small (max $5-10). Sell when it falls 30% below its best price after you buy "
+                f"(right now: below {fmt_price(s['price'] * (1 - GRAD_TRAIL))}). I will message you when to sell, for up to 48h.\n"
+                f"Most of these trades lose about 30%; a few big runners pay for them.\n"
+                f"This setup, last 48h: {st['n']} coins, {st['win']:.0%} winners, avg {st['avg']:+.0%} per trade.\n"
+                f"https://jup.ag/swap/SOL-{mint}")
+        self.push(f"GRADUATION SURVIVOR: {c['sym']}", body, s["url"] or "", "high")
+
     def manage_open(self, now):
         for mint, o in list(self.state["open"].items()):
             c = self.coins.get(mint)
             s = c["hist"][-1] if c and c["hist"] else None
             why = None
             r = s["price"] / o["entry"] if s and o["entry"] else None
-            if r is not None and r >= 1 + o["tp"]:
+            if o.get("kind") == "trail":
+                if s:
+                    o["peak"] = max(o["peak"], s["price"])
+                if s and s["price"] <= o["peak"] * (1 - o["trail"]):
+                    why = f"TRAILING STOP HIT, {(r - 1) * 100:+.0f}% from your buy - sell now"
+                elif now - o["t"] >= o["hold"]:
+                    why = f"48H UP, now {(r - 1) * 100:+.0f}% - sell" if r else "48H UP - sell"
+                elif s is None and (not c or now - c.get("added", 0) > 600):
+                    why = "lost track of price - check it and sell"
+            elif r is not None and r >= 1 + o["tp"]:
                 why = f"TARGET HIT +{(r-1)*100:.0f}% - sell now"
             elif r is not None and r <= 1 - o["sl"]:
                 why = f"STOP HIT {(r-1)*100:.0f}% - sell now"
             elif now - o["t"] >= o["hold"]:
                 why = f"TIME UP ({o['hold']//60} min), now {(r-1)*100:+.0f}% - sell" if r else "TIME UP - sell"
-            elif s is None:
+            elif s is None and (not c or now - c.get("added", 0) > 600):
                 why = "lost track of price - check it and sell"
             if why:
                 self.push(f"{why.split(' -')[0]}: {o['sym']}",
@@ -367,6 +458,10 @@ class Watcher:
         lines.append(f"Setups switched on: {len(live)}" + ("" if live else " (none has made money yet, so no alerts)"))
         best = sorted(self.state["stats"].items(), key=lambda kv: -kv[1]["avg"])[:3]
         lines += [f"  {k}: {v['n']} coins, avg {v['avg']:+.0%}" for k, v in best]
+        g = self.state["stats"].get(GRAD_RULE)
+        if g:
+            lines.append(f"Graduation-survivor test: {g['n']} trades, avg {g['avg']:+.0%} (older {g['old']:+.0%}, "
+                         f"newer {g['new']:+.0%}); switches on at {GRAD_MIN_COINS}+ trades with both halves positive")
         lines.append(f"Sent {uk_now()}")
         self.push("Launch watch daily report", "\n".join(lines), priority="low")
 
