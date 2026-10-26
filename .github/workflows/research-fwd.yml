@@ -1,0 +1,35 @@
+name: research-forward
+
+# One-off research run (not part of the alert system): follows a list of wallets live for a
+# few hours, recording their buys/sells and the coins' prices, then uploads the log.
+on:
+  workflow_dispatch:
+    inputs:
+      wallets:
+        description: "Wallet list (in research/data)"
+        default: "research/data/gmgn_wallets.txt"
+      minutes:
+        description: "How long to follow them"
+        default: "320"
+
+permissions:
+  contents: read
+
+jobs:
+  follow:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Follow wallets
+        timeout-minutes: 340
+        run: python research/fwd_copy.py "${{ inputs.wallets }}" fwd_copy.json "${{ inputs.minutes }}"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: fwd-copy
+          path: fwd_copy.json
+          retention-days: 7
