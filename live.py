@@ -31,6 +31,8 @@ from zoneinfo import ZoneInfo
 
 import websockets
 
+from research.news_test import FEEDS as NEWS_FEEDS, fetch as fetch_feed, keywords_from, match as news_match
+
 WS = "wss://pumpportal.fun/api/data"
 DEX = "https://api.dexscreener.com/tokens/v1/solana/"
 POLL = 30             # seconds between DexScreener sweeps
@@ -51,6 +53,15 @@ GRAD_TRACK_H = 48     # graduated coins that stay alive are followed this long .
 GRAD_SLOW_AFTER = 4 * 3600
 SLOW_POLL = 300       # ... and polled every 5 min after their first 4 hours
 GRAD_MIN_COINS = 150  # high-variance setup (most trades lose ~30%), so it needs more trades to prove itself
+# News coins: new coins named after a trending Google search or a current headline.
+NEWS_REFRESH = 300    # seconds between news/trends reads
+NEWS_TTL = 12 * 3600  # a keyword stays "in the news" this long
+NEWS_DELAY = 60       # alert/entry this long after launch (time to notice and buy)
+NEWS_MIN_COINS = 40
+NEWS_RULES = {
+    "News-named new coin, buy 1 min after launch, +100%/-40%/60m": (1.0, 0.4, 3600),
+    "News-named new coin, buy 1 min after launch, +50%/-30%/30m": (0.5, 0.3, 1800),
+}
 REPORT_HOUR_UTC = 9
 UA = {"User-Agent": "Mozilla/5.0"}
 LOG_VERSION = 2       # v2: graduated coins are priced from their graduated pool (v1 could read the frozen curve)
@@ -198,6 +209,28 @@ def grad_trades(coins, last_t):
     return res
 
 
+def news_trades(coins, last_t, tp, sl, hold):
+    """News-named coins: buy at the first snapshot 1+ min after launch, fixed exits."""
+    res = []
+    for h in coins.values():
+        born = h[0].get("born")
+        if not born or not any(r.get("news") for r in h):
+            continue
+        ent = [x for x in h if x["t"] >= born + NEWS_DELAY and x["price"] > 0]
+        if not ent or ent[0]["t"] > born + NEWS_DELAY + 120:
+            continue
+        i = h.index(ent[0])
+        if i == 0:
+            h = [dict(ent[0], t=ent[0]["t"] - 1)] + h  # trade() buys at the snapshot after h[i]
+            i = 0
+        else:
+            i -= 1
+        r = trade(h, i, tp, sl, hold, last_t)
+        if r is not None:
+            res.append((born, r))
+    return res
+
+
 def summarize(res):
     res.sort()
     rets = [r for _, r in res]
@@ -226,12 +259,16 @@ def backtest(coins):
     res = grad_trades(coins, last_t)
     if res:
         stats[GRAD_RULE] = summarize(res)
+    for name, (tp, sl, hold) in NEWS_RULES.items():
+        res = news_trades(coins, last_t, tp, sl, hold)
+        if res:
+            stats[name] = summarize(res)
     return stats
 
 
 def live_rules(stats):
     good = {k: v for k, v in stats.items()
-            if v["n"] >= (GRAD_MIN_COINS if k == GRAD_RULE else MIN_COINS)
+            if v["n"] >= (GRAD_MIN_COINS if k == GRAD_RULE else NEWS_MIN_COINS if k in NEWS_RULES else MIN_COINS)
             and v["avg"] >= MIN_AVG and v["old"] > 0 and v["new"] > 0}
     return dict(sorted(good.items(), key=lambda kv: -kv[1]["avg"]))
 
@@ -252,6 +289,7 @@ class Watcher:
             self.state.update(json.load(open(self.state_path, encoding="utf-8")))
         self.last_test = 0
         self.created = 0  # new-coin events heard this run
+        self.news_kw = {}  # keyword -> {"t": first seen, "src": feed}
         for mint, o in self.state["open"].items():  # keep following positions opened by an earlier run
             self.coins[mint] = {"born": None, "sym": o["sym"], "dev_sol": 0, "grad": o.get("grad") or o["t"],
                                 "logged": True, "hist": [], "added": time.time(), "grad_seen": True}
@@ -280,8 +318,11 @@ class Watcher:
         now = time.time()
         if m.get("txType") == "create":
             self.created += 1
-            self.coins.setdefault(mint, {"born": now, "sym": m.get("symbol"), "dev_sol": m.get("solAmount") or 0,
-                                         "grad": None, "logged": False, "hist": []})
+            k = news_match(self.news_kw, m.get("name"), m.get("symbol")) if self.news_kw else None
+            self.coins.setdefault(mint, {"born": now, "sym": m.get("symbol"), "name": m.get("name"),
+                                         "dev_sol": m.get("solAmount") or 0, "grad": None,
+                                         "logged": bool(k),  # log news coins from the start (no survivor bias)
+                                         "news": k, "news_src": self.news_kw[k]["src"] if k else None, "hist": []})
         elif m.get("txType") == "migrate" or m.get("pool") in ("pump-amm", "raydium"):
             c = self.coins.setdefault(mint, {"born": None, "sym": m.get("symbol"), "dev_sol": 0,
                                              "grad": None, "logged": False, "hist": []})
@@ -325,14 +366,15 @@ class Watcher:
                 s["t"] = round(now)
                 s["url"] = p.get("url")
                 c["sym"] = c["sym"] or p["baseToken"].get("symbol")
-                c["name"] = p["baseToken"].get("name")
+                c["name"] = c.get("name") or p["baseToken"].get("name")
                 c["hist"] = c["hist"][-20:] + [s]
                 s["g2"] = growth(c["hist"], s)
                 c["logged"] = c["logged"] or s["mc"] >= LOG_MC
                 if self.log and c["logged"]:
                     row = {k: v for k, v in s.items() if k not in ("url", "g2")}
                     self.log.write(json.dumps({"mint": a, "sym": c["sym"], "born": c["born"], "grad": c["grad"],
-                                               "dev_sol": c["dev_sol"], "v": LOG_VERSION, **row}) + "\n")
+                                               "dev_sol": c["dev_sol"], "v": LOG_VERSION, "news": c.get("news"),
+                                               **row}) + "\n")
                 self.check(a, c, s)
         if self.log:
             self.log.flush()
@@ -353,8 +395,25 @@ class Watcher:
             if GRAD_RULE in self.state["live"]:
                 self.alert_survivor(mint, c, s, self.state["live"][GRAD_RULE])
                 return
+        if c.get("news") and not c.get("news_seen") and c["born"] and s["t"] >= c["born"] + NEWS_DELAY:
+            c["news_seen"] = True  # first chance only, as in the backtest
+            for name, st in self.state["live"].items():
+                if name in NEWS_RULES and s["price"] > 0:
+                    tp, sl, hold = NEWS_RULES[name]
+                    self.state["alerted"][mint] = s["t"]
+                    self.state["open"][mint] = {"sym": c["sym"], "rule": name, "entry": s["price"], "t": s["t"],
+                                                "tp": tp, "sl": sl, "hold": hold, "url": s["url"]}
+                    body = (f"{c.get('name') or c['sym']} ({c['sym']}) launched 1 min ago, named after "
+                            f"'{c['news']}' which is in the news now ({c.get('news_src')})\n"
+                            f"Price {fmt_price(s['price'])} at {uk_now()} | MC {fmt_money(s['mc'])}\n"
+                            f"PLAN: sell at {fmt_price(s['price'] * (1 + tp))} (+{tp:.0%}), stop at "
+                            f"{fmt_price(s['price'] * (1 - sl))} (-{sl:.0%}), or after {hold // 60} min. I will message you.\n"
+                            f"This setup, last 48h: {st['n']} coins, {st['win']:.0%} winners, avg {st['avg']:+.0%} per trade.\n"
+                            f"Very high risk - small amounts only.\nhttps://jup.ag/swap/SOL-{mint}")
+                    self.push(f"NEWS COIN: {c['sym']}", body, s["url"] or "", "high")
+                    return
         for name, st in self.state["live"].items():
-            if name == GRAD_RULE:
+            if name == GRAD_RULE or name in NEWS_RULES:
                 continue
             rule = RULES.get(name)
             if rule and matches(rule, s):
@@ -458,6 +517,12 @@ class Watcher:
         lines.append(f"Setups switched on: {len(live)}" + ("" if live else " (none has made money yet, so no alerts)"))
         best = sorted(self.state["stats"].items(), key=lambda kv: -kv[1]["avg"])[:3]
         lines += [f"  {k}: {v['n']} coins, avg {v['avg']:+.0%}" for k, v in best]
+        for name in NEWS_RULES:
+            n_ = self.state["stats"].get(name)
+            if n_:
+                lines.append(f"News-coin test ({name.split(', ')[-1]}): {n_['n']} coins, avg {n_['avg']:+.0%} "
+                             f"(older {n_['old']:+.0%}, newer {n_['new']:+.0%}); switches on at {NEWS_MIN_COINS}+ with both halves positive")
+        lines.append(f"Trending keywords tracked now: {len(self.news_kw)}")
         g = self.state["stats"].get(GRAD_RULE)
         if g:
             lines.append(f"Graduation-survivor test: {g['n']} trades, avg {g['avg']:+.0%} (older {g['old']:+.0%}, "
@@ -479,10 +544,27 @@ async def listen(w):
             await asyncio.sleep(5)
 
 
+async def news_loop(w):
+    """Keep w.news_kw filled with what is trending in searches and headlines right now."""
+    while True:
+        for src, url in NEWS_FEEDS.items():
+            try:
+                kws = await asyncio.to_thread(lambda: keywords_from(src, fetch_feed(url)))
+                now = time.time()
+                for k in kws:
+                    w.news_kw.setdefault(k, {"t": now, "src": src})
+            except Exception as e:
+                print("news feed error", src, e, file=sys.stderr)
+        now = time.time()
+        w.news_kw = {k: v for k, v in w.news_kw.items() if now - v["t"] < NEWS_TTL}
+        await asyncio.sleep(NEWS_REFRESH)
+
+
 async def run(args):
     w = Watcher(args)
     end = time.time() + args.hours * 3600
     task = asyncio.create_task(listen(w))
+    news_task = asyncio.create_task(news_loop(w))
     started = time.time()
     while time.time() < end:
         t = time.time()
@@ -492,6 +574,7 @@ async def run(args):
         print(time.strftime("%H:%M:%S"), "watching", len(w.coins), "open", len(w.state["open"]), flush=True)
         await asyncio.sleep(max(1, POLL - (time.time() - t)))
     task.cancel()
+    news_task.cancel()
     if w.log:
         w.log.close()
         if args.state:  # compress this run's log for the cache
