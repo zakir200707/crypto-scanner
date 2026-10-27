@@ -760,6 +760,14 @@ def main():
 
     while True:
         passed, rejected, s1 = scan(a.min_age, db)
+        # every coin that passed all filters, so the score can later be graded against what happened next
+        seen = {x["mint"] for x in last.get("passed_log", [])[-3000:] if x["t"] > time.time() - 86400}
+        for m in passed:
+            if m["mint"] not in seen:
+                last.setdefault("passed_log", []).append({"t": time.time(), "mint": m["mint"], "sym": m["symbol"],
+                                                          "pair": m["pair"], "tier": m.get("tier"), "score": m["score"],
+                                                          "price": m["price"], "mc": m["mc"]})
+        last["passed_log"] = last.get("passed_log", [])[-3000:]
         save_db()
         best = report(passed, rejected, s1)
         print(f"\nsaved {save(passed, rejected)}")
