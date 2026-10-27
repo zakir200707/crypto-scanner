@@ -3,3 +3,5 @@ state/
 __pycache__/
 .claude/
 skills-lock.json
+.gmgn/
+.env

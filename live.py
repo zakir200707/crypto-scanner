@@ -24,6 +24,7 @@ import math
 import os
 import statistics
 import sys
+import threading
 import time
 import urllib.request
 from datetime import datetime, timezone
@@ -62,6 +63,13 @@ NEWS_RULES = {
     "News-named new coin, buy 1 min after launch, +100%/-40%/60m": (1.0, 0.4, 3600),
     "News-named new coin, buy 1 min after launch, +50%/-30%/30m": (0.5, 0.3, 1800),
 }
+# Pre-graduation: buy on the Pump.fun curve once the market cap crosses a threshold, sell
+# straight after graduation, when Pump.fun's BOOST auto-buys push the new pool's price up.
+PREGRAD_SELL_AFTER = 60   # seconds after graduation we assume it takes to sell
+PREGRAD_HOLD = 3600       # sell anyway if it has not graduated within an hour
+PREGRAD_MIN_COINS = 40
+PREGRAD_RULES = {f"Pre-graduation: MC crosses ${t/1e3:.0f}K on the curve, sell 1 min after graduation": t
+                 for t in (28000, 31000, 34000)}
 REPORT_HOUR_UTC = 9
 UA = {"User-Agent": "Mozilla/5.0"}
 LOG_VERSION = 2       # v2: graduated coins are priced from their graduated pool (v1 could read the frozen curve)
@@ -231,6 +239,33 @@ def news_trades(coins, last_t, tp, sl, hold):
     return res
 
 
+def pregrad_trades(coins, last_t, thr):
+    """Buy at the curve snapshot after the first one with MC >= thr; sell at the first graduated-pool
+    snapshot PREGRAD_SELL_AFTER s after graduation, or at the last curve price after PREGRAD_HOLD."""
+    res = []
+    for h in coins.values():
+        if min(r.get("v", 1) for r in h) < 2:
+            continue
+        g = max((r.get("grad") or 0) for r in h)
+        curve = [r for r in h if r.get("dex") == "pumpfun" and r["price"] > 0 and (not g or r["t"] < g)]
+        i = next((k for k, r in enumerate(curve) if r["mc"] >= thr), None)
+        if i is None or i + 1 >= len(curve):
+            continue  # never crossed, or graduated before the next look (too late to buy on the curve)
+        e = curve[i + 1]
+        if g and g <= e["t"] + PREGRAD_HOLD:
+            post = [r for r in h if r.get("dex") != "pumpfun" and r["price"] > 0 and r["t"] >= g + PREGRAD_SELL_AFTER]
+            if post:
+                res.append((curve[i]["t"], post[0]["price"] / e["price"] - 1 - COST))
+            elif h[-1]["t"] < last_t - 900:
+                res.append((curve[i]["t"], h[-1]["price"] / e["price"] - 1 - COST))  # pool never priced: last seen
+            continue
+        if e["t"] + PREGRAD_HOLD > last_t and h[-1]["t"] > last_t - 120:
+            continue  # still running
+        later = [r for r in curve if e["t"] < r["t"] <= e["t"] + PREGRAD_HOLD]
+        res.append((curve[i]["t"], (later[-1]["price"] if later else e["price"]) / e["price"] - 1 - COST))
+    return res
+
+
 def summarize(res):
     res.sort()
     rets = [r for _, r in res]
@@ -263,12 +298,17 @@ def backtest(coins):
         res = news_trades(coins, last_t, tp, sl, hold)
         if res:
             stats[name] = summarize(res)
+    for name, thr in PREGRAD_RULES.items():
+        res = pregrad_trades(coins, last_t, thr)
+        if res:
+            stats[name] = summarize(res)
     return stats
 
 
 def live_rules(stats):
     good = {k: v for k, v in stats.items()
-            if v["n"] >= (GRAD_MIN_COINS if k == GRAD_RULE else NEWS_MIN_COINS if k in NEWS_RULES else MIN_COINS)
+            if v["n"] >= (GRAD_MIN_COINS if k == GRAD_RULE else NEWS_MIN_COINS if k in NEWS_RULES
+                          else PREGRAD_MIN_COINS if k in PREGRAD_RULES else MIN_COINS)
             and v["avg"] >= MIN_AVG and v["old"] > 0 and v["new"] > 0}
     return dict(sorted(good.items(), key=lambda kv: -kv[1]["avg"]))
 
@@ -327,6 +367,15 @@ class Watcher:
             c = self.coins.setdefault(mint, {"born": None, "sym": m.get("symbol"), "dev_sol": 0,
                                              "grad": None, "logged": False, "hist": []})
             c["grad"] = c["grad"] or now
+            o = self.state["open"].get(mint)
+            if o and o.get("kind") == "pregrad" and not o.get("sell_sent"):
+                o["sell_sent"] = True  # tell the phone at once; manage_open records the result later
+                threading.Thread(target=self.push, daemon=True, args=(
+                    f"GRADUATED - SELL NOW: {o['sym']}",
+                    f"{o['sym']} just graduated at {uk_now()}. Sell now, within a minute: the auto-buys after "
+                    f"graduation push the price up first, then most coins dump.\n"
+                    f"Bought around {fmt_price(o['entry'])}.\nhttps://jup.ag/swap/{mint}-SOL",
+                    o["url"] or "", "urgent")).start()
 
     def sweep(self):
         now = time.time()
@@ -412,8 +461,16 @@ class Watcher:
                             f"Very high risk - small amounts only.\nhttps://jup.ag/swap/SOL-{mint}")
                     self.push(f"NEWS COIN: {c['sym']}", body, s["url"] or "", "high")
                     return
+        if not c["grad"] and s.get("dex") == "pumpfun" and s["price"] > 0:
+            seen = c.setdefault("pregrad_seen", [])  # thresholds already crossed: first crossing only, as in the backtest
+            for name, st in self.state["live"].items():
+                thr = PREGRAD_RULES.get(name)
+                if thr and s["mc"] >= thr and thr not in seen:
+                    self.alert_pregrad(mint, c, s, name, st)
+                    return
+            seen += [t for t in PREGRAD_RULES.values() if s["mc"] >= t and t not in seen]
         for name, st in self.state["live"].items():
-            if name == GRAD_RULE or name in NEWS_RULES:
+            if name == GRAD_RULE or name in NEWS_RULES or name in PREGRAD_RULES:
                 continue
             rule = RULES.get(name)
             if rule and matches(rule, s):
@@ -448,13 +505,39 @@ class Watcher:
                 f"https://jup.ag/swap/SOL-{mint}")
         self.push(f"GRADUATION SURVIVOR: {c['sym']}", body, s["url"] or "", "high")
 
+    def alert_pregrad(self, mint, c, s, name, st):
+        self.state["alerted"][mint] = s["t"]
+        self.state["open"][mint] = {"sym": c["sym"], "rule": name, "entry": s["price"], "t": s["t"],
+                                    "kind": "pregrad", "hold": PREGRAD_HOLD, "url": s["url"]}
+        body = (f"{c.get('name') or c['sym']} ({c['sym']}) is close to graduating from Pump.fun: "
+                f"MC {fmt_money(s['mc'])} at {uk_now()}, price {fmt_price(s['price'])}\n"
+                f"PLAN: buy small NOW on Pump.fun (max $5-10), only if it has NOT graduated yet and the price is "
+                f"under {fmt_price(s['price'] * 1.15)}. Sell within a minute of graduation - I will send "
+                f"GRADUATED - SELL NOW. If it has not graduated in 1 hour, sell anyway.\n"
+                f"This setup, last 48h: {st['n']} coins, {st['win']:.0%} winners, avg {st['avg']:+.0%} per trade.\n"
+                f"https://pump.fun/coin/{mint}")
+        self.push(f"ABOUT TO GRADUATE: {c['sym']}", body, f"https://pump.fun/coin/{mint}", "high")
+
     def manage_open(self, now):
         for mint, o in list(self.state["open"].items()):
             c = self.coins.get(mint)
             s = c["hist"][-1] if c and c["hist"] else None
             why = None
             r = s["price"] / o["entry"] if s and o["entry"] else None
-            if o.get("kind") == "trail":
+            if o.get("kind") == "pregrad":
+                if c and c["grad"]:
+                    if s and s.get("dex") != "pumpfun" and s["t"] >= c["grad"] + PREGRAD_SELL_AFTER:
+                        self.state["closed"].append({**o, "exit_t": now, "ret": r - 1, "why": "graduated"})
+                        del self.state["open"][mint]
+                    elif now - c["grad"] > 900:
+                        self.state["closed"].append({**o, "exit_t": now, "ret": None, "why": "graduated, no pool price"})
+                        del self.state["open"][mint]
+                    continue  # the sell message went out when the graduation was heard
+                if now - o["t"] >= o["hold"]:
+                    why = f"NOT GRADUATED IN 1H, now {(r - 1) * 100:+.0f}% - sell" if r else "NOT GRADUATED IN 1H - sell"
+                elif s is None and (not c or now - c.get("added", 0) > 600):
+                    why = "lost track of price - check it and sell"
+            elif o.get("kind") == "trail":
                 if s:
                     o["peak"] = max(o["peak"], s["price"])
                 if s and s["price"] <= o["peak"] * (1 - o["trail"]):
@@ -523,6 +606,11 @@ class Watcher:
                 lines.append(f"News-coin test ({name.split(', ')[-1]}): {n_['n']} coins, avg {n_['avg']:+.0%} "
                              f"(older {n_['old']:+.0%}, newer {n_['new']:+.0%}); switches on at {NEWS_MIN_COINS}+ with both halves positive")
         lines.append(f"Trending keywords tracked now: {len(self.news_kw)}")
+        for name, thr in PREGRAD_RULES.items():
+            p_ = self.state["stats"].get(name)
+            if p_:
+                lines.append(f"Pre-graduation test (${thr/1e3:.0f}K): {p_['n']} coins, avg {p_['avg']:+.0%} "
+                             f"(older {p_['old']:+.0%}, newer {p_['new']:+.0%}); switches on at {PREGRAD_MIN_COINS}+ with both halves positive")
         g = self.state["stats"].get(GRAD_RULE)
         if g:
             lines.append(f"Graduation-survivor test: {g['n']} trades, avg {g['avg']:+.0%} (older {g['old']:+.0%}, "
