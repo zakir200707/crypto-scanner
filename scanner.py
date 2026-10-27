@@ -763,6 +763,7 @@ def main():
         # every coin that passed all filters, so the score can later be graded against what happened next
         seen = {x["mint"] for x in last.get("passed_log", [])[-3000:] if x["t"] > time.time() - 86400}
         for m in passed:
+            print(f"PASSED {m['mint']} {m['pair']} {m.get('tier')} score={m['score']} price={m['price']} mc={m['mc']:.0f}")
             if m["mint"] not in seen:
                 last.setdefault("passed_log", []).append({"t": time.time(), "mint": m["mint"], "sym": m["symbol"],
                                                           "pair": m["pair"], "tier": m.get("tier"), "score": m["score"],
