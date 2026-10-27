@@ -67,7 +67,8 @@ NEWS_RULES = {
 # straight after graduation, when Pump.fun's BOOST auto-buys push the new pool's price up.
 PREGRAD_SELL_AFTER = 60   # seconds after graduation we assume it takes to sell
 PREGRAD_HOLD = 3600       # sell anyway if it has not graduated within an hour
-PREGRAD_MIN_COINS = 40
+PREGRAD_MIN_COINS = 60   # first tests: about +30% per trade in one 2.5h window, flat in the next, so it must
+                         # also make MIN_AVG in BOTH halves before it may alert
 PREGRAD_RULES = {f"Pre-graduation: MC crosses ${t/1e3:.0f}K on the curve, sell 1 min after graduation": t
                  for t in (28000, 31000, 34000)}
 REPORT_HOUR_UTC = 9
@@ -309,7 +310,8 @@ def live_rules(stats):
     good = {k: v for k, v in stats.items()
             if v["n"] >= (GRAD_MIN_COINS if k == GRAD_RULE else NEWS_MIN_COINS if k in NEWS_RULES
                           else PREGRAD_MIN_COINS if k in PREGRAD_RULES else MIN_COINS)
-            and v["avg"] >= MIN_AVG and v["old"] > 0 and v["new"] > 0}
+            and v["avg"] >= MIN_AVG and v["old"] > 0 and v["new"] > 0
+            and (k not in PREGRAD_RULES or min(v["old"], v["new"]) >= MIN_AVG)}
     return dict(sorted(good.items(), key=lambda kv: -kv[1]["avg"]))
 
 
@@ -610,7 +612,7 @@ class Watcher:
             p_ = self.state["stats"].get(name)
             if p_:
                 lines.append(f"Pre-graduation test (${thr/1e3:.0f}K): {p_['n']} coins, avg {p_['avg']:+.0%} "
-                             f"(older {p_['old']:+.0%}, newer {p_['new']:+.0%}); switches on at {PREGRAD_MIN_COINS}+ with both halves positive")
+                             f"(older {p_['old']:+.0%}, newer {p_['new']:+.0%}); switches on at {PREGRAD_MIN_COINS}+ with both halves +5% or better")
         g = self.state["stats"].get(GRAD_RULE)
         if g:
             lines.append(f"Graduation-survivor test: {g['n']} trades, avg {g['avg']:+.0%} (older {g['old']:+.0%}, "
