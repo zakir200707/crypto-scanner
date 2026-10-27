@@ -1,0 +1,41 @@
+name: research-run
+
+# One-off research job (not part of the alert system): runs one research script for a few hours
+# on a GitHub machine and uploads whatever it writes to out/.
+on:
+  workflow_dispatch:
+    inputs:
+      script:
+        description: "Research script, e.g. research/pregrad_test.py"
+        required: true
+      args:
+        description: "Arguments (write results under out/)"
+        default: ""
+      name:
+        description: "Artifact name"
+        default: "research"
+
+permissions:
+  contents: read
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install websockets==16.0
+      - name: Run
+        timeout-minutes: 340
+        run: |
+          mkdir -p out
+          python "${{ inputs.script }}" ${{ inputs.args }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ${{ inputs.name }}
+          path: out
+          retention-days: 7

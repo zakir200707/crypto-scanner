@@ -59,6 +59,11 @@ def main():
         report("BASELINE: random sample of other new coins", [c for c in coins if not c["kw"]])
         top = sorted((c for c in coins if c["kw"]), key=lambda c: -max([s["mc"] for s in c["snaps"]] or [0]))[:8]
         print("\n  best news coins:", ", ".join(f"{c['sym']}<-{c['kw']} (max MC ${max([s['mc'] for s in c['snaps']] or [0])/1e3:.0f}K)" for c in top))
+    elif kind == "telegram":
+        coins = list(D.values())
+        report("ALL Telegram calls", coins)
+        for ch in sorted({c["channel"] for c in coins}):
+            report(f"channel {ch}", [c for c in coins if c["channel"] == ch])
     else:
         coins = list(D.values())
         for k in ("profile", "boost", "cto"):
