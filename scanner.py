@@ -715,6 +715,10 @@ def main():
                     except Exception as e:
                         print(f"push failed: {e}")
                 if close:
+                    # result of following the plan (half sold at +50% once stage 1 was reached), after ~3% costs
+                    ret = (0.25 + 0.5 * (r - 1)) if o["stage"] == 1 else (r - 1)
+                    last.setdefault("closed", []).append({"sym": o["sym"], "t": now, "ret": round(ret - 0.03, 4)})
+                    last["closed"] = last["closed"][-300:]
                     del last["open"][mint]
 
     def daily_report(best, fired):
@@ -735,6 +739,14 @@ def main():
             sym, sc = st["best"].get(tier) or ("none passed", None)
             lines.append(f"{label}: {sym}" + (f" (score {sc})" if sc is not None else ""))
         lines.append(f"{smart_n} proven smart wallets tracked.")
+        done = last.get("closed", [])
+        if done:  # honest running score of the alerts, if you followed every sell signal
+            wk = [c["ret"] for c in done if c["t"] > now.timestamp() - 7 * 86400]
+            lines.append(f"Alert results so far: {len(done)} finished, {sum(c['ret'] > 0 for c in done)} won, "
+                         f"avg {sum(c['ret'] for c in done) / len(done):+.0%} per trade"
+                         + (f" (last 7 days: {len(wk)}, avg {sum(wk) / len(wk):+.0%})" if wk else ""))
+        if last.get("open"):
+            lines.append(f"Still following: {', '.join(o['sym'] for o in last['open'].values())}")
         lines.append(f"Sent {uk_now()}")
         print("DAILY REPORT\n" + "\n".join(lines))
         if a.ntfy:
