@@ -58,6 +58,9 @@ DB_VERSION = 2            # bump to wipe wallet memory when grading rules change
 MAX_RUNUP_MAIN = 300      # % above 24h low: beyond this the move already happened
 MAX_RUNUP_EARLY = 400
 MAX_PUMP_1H = 25          # % up in the last hour: the pump is already under way, an alert would be late
+# Report card of 48 best picks (24-28 Oct): picks with 1.25x+ more buying than selling wallets made
+# +16% / +4% per trade in the older / newer half; the rest -11%. 4 of the 6 losing alerts had fewer buyers.
+MIN_BUY_RATIO = 1.25      # unique buyer / seller wallets in the last 300 trades, needed to alert
 MAX_DRIFT = 10            # % the price may move while the scan runs before the alert is dropped
 MAX_WHALE_EXIT = 0.2      # whales net selling more than this share of liquidity in 6h: reject
 BUY_LIMIT = 1.10          # alerts say "don't buy above" this multiple of the alert price
@@ -609,6 +612,7 @@ def push(topic, b):
            f"Price {fmt_price(b['price'])} at {uk_now()}\n"
            f"DON'T BUY ABOVE {fmt_price(b['price'] * BUY_LIMIT)} - if it's higher you're late, skip it.\n"
            f"Plan: stop {fmt_price(b['price'] * 0.75)} (-25%), sell half at {fmt_price(b['price'] * 1.5)} (+50%). Max $10.\n"
+           f"Buyers {b['uniq_buyers']} vs sellers {b['uniq_sellers']} (last 300 trades)\n"
            f"MC {fmt_money(b['mc'])} | liq {fmt_money(b['liq'])} | {b['from_24h_high']:.0f}% off 24h high\n"
            f"Up {b['from_24h_low']:.0f}% from 24h low | volume {b['vol_accel']:.1f}x | "
            f"radar {b['radar']} smart wallet(s)\n"
@@ -664,7 +668,10 @@ def main():
         sent = {m: t for m, t in last.get("alerted", {}).items() if now - t < 86400}
         for tier, bar in (("main", ALERT_MAIN), ("early", ALERT_EARLY)):
             b = best.get(tier)
-            skip = b and b["mint"] not in sent and b["score"] >= bar and refresh(b)
+            ratio = b["uniq_buyers"] / max(1, b["uniq_sellers"]) if b else 0
+            skip = b and b["mint"] not in sent and b["score"] >= bar and (
+                ratio < MIN_BUY_RATIO and f"buyers {b['uniq_buyers']} vs sellers {b['uniq_sellers']}, "
+                                          f"need {MIN_BUY_RATIO}x" or refresh(b))
             if skip:
                 print(f"not alerting {b['symbol']}: {skip}")
             elif b and b["mint"] not in sent and b["score"] >= bar:
@@ -673,7 +680,7 @@ def main():
                     push(a.ntfy, b)
                 sent[b["mint"]] = now
                 last.setdefault("open", {})[b["mint"]] = {"sym": b["symbol"], "pair": b["pair"], "price": b["price"],
-                                                          "t": now, "stage": 0, "url": b["url"]}
+                                                          "t": now, "stage": 0, "url": b["url"], "bs": round(ratio, 2)}
                 fired = True
             last[tier] = b["mint"] if b else None
         last["alerted"] = sent
@@ -717,7 +724,8 @@ def main():
                 if close:
                     # result of following the plan (half sold at +50% once stage 1 was reached), after ~3% costs
                     ret = (0.25 + 0.5 * (r - 1)) if o["stage"] == 1 else (r - 1)
-                    last.setdefault("closed", []).append({"sym": o["sym"], "t": now, "ret": round(ret - 0.03, 4)})
+                    last.setdefault("closed", []).append({"sym": o["sym"], "t": now, "ret": round(ret - 0.03, 4),
+                                                          "bs": o.get("bs")})
                     last["closed"] = last["closed"][-300:]
                     del last["open"][mint]
 
