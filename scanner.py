@@ -606,6 +606,11 @@ def refresh(b):
     return None
 
 
+def axiom(pair):
+    """Axiom's page for a pool (log in to Axiom in the phone's browser once so the link opens the coin)."""
+    return f"https://axiom.trade/meme/{pair}"
+
+
 def push(topic, b):
     """Phone alert via ntfy.sh (install the ntfy app and subscribe to the same topic)."""
     msg = (f"{b['name']} ({b['symbol']}) score {b['score']}\n"
@@ -618,12 +623,13 @@ def push(topic, b):
            f"radar {b['radar']} smart wallet(s)\n"
            f"Whales net 6h ${b['whale_net_6h']:,.0f} | accumulators {b['accumulators']} | "
            f"smart wallets {b['smart_buyers']}\n"
-           f"{'; '.join(b['risks']) or 'no rugcheck warnings'}\n{b['url']}")
+           f"{'; '.join(b['risks']) or 'no rugcheck warnings'}\n"
+           f"Trade on Axiom: {axiom(b['pair'])}\nChart: {b['url']}")
     kind = "EARLY GEM (high risk)" if b["tier"] == "early" else "New pick"
     title = f"{kind}: {b['symbol']}".encode("ascii", "ignore").decode()
     try:
         req = urllib.request.Request(f"https://ntfy.sh/{topic}", data=msg.encode(),
-                                     headers={"Title": title, "Click": b["url"] or ""})
+                                     headers={"Title": title, "Click": axiom(b["pair"])})
         urllib.request.urlopen(req, timeout=15)
     except Exception as e:
         print(f"push failed: {e}")
@@ -714,10 +720,11 @@ def main():
                 print(f"follow-up {o['sym']}: {msg}")
                 if a.ntfy:
                     try:
-                        body = f"{o['sym']}: {msg}\nAlert price {fmt_price(o['price'])}, now {fmt_price(px)} at {uk_now()}\n{o['url']}"
+                        body = f"{o['sym']}: {msg}\nAlert price {fmt_price(o['price'])}, now {fmt_price(px)} at {uk_now()}\n" \
+                               f"Sell on Axiom: {axiom(o['pair'])}\nChart: {o['url']}"
                         req = urllib.request.Request(f"https://ntfy.sh/{a.ntfy}", data=body.encode(),
                                                      headers={"Title": f"SELL SIGNAL: {o['sym']}".encode("ascii", "ignore").decode(),
-                                                              "Priority": "high", "Click": o["url"] or ""})
+                                                              "Priority": "high", "Click": axiom(o["pair"])})
                         urllib.request.urlopen(req, timeout=15)
                     except Exception as e:
                         print(f"push failed: {e}")
