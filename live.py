@@ -9,7 +9,8 @@ No rule is trusted up front. Every snapshot is logged, and every hour each candi
 rule is backtested on the last 48h as a real trade (one alert per coin, buy ~30s late,
 take-profit / stop-loss / time limit, 3% costs). Only rules that made money on both
 the older and the newer half of the data send alerts, and each alert is followed by
-a "sell now" message when its target, stop or time limit is hit.
+a "sell now" message when its target, stop or time limit is hit. Alerts only reach the
+phone when PHONE_ALERTS is on (currently off: see its comment).
 
   python live.py --log results/live_snaps.jsonl --hours 3     # collect only
   python live.py --ntfy TOPIC --state state --hours 5.6       # GitHub Actions
@@ -46,6 +47,10 @@ RETEST = 3600         # seconds between backtests
 COST = 0.03           # round-trip fees + slippage
 MIN_COINS = 25        # a rule needs this many past trades before it may alert
 MIN_AVG = 0.05        # ... and this average return per trade
+# Phone alerts are off. Every setup here buys coins minutes old, and none has held up: on 29 Oct the
+# news-coin rule scraped past MIN_AVG for 8h and sent 148 alerts (81 coins, 5% won, avg -10%), matching
+# words like "test", "black", "right". The watcher still records data and self-tests in the run log.
+PHONE_ALERTS = False
 GRAD_RULE = "Survived graduation (5+ min after, MC $10K+), 30% trailing stop, max 48h"
 GRAD_WAIT = 300       # seconds after graduation before a coin counts as having survived the first dump
 GRAD_MIN_MC = 1e4
