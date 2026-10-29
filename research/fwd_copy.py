@@ -6,6 +6,11 @@ DexScreener every cycle for TRACK_H hours. research/score_copy.py turns this int
 for "buy when they buy" with fixed exits or "sell when they sell".
 
   python research/fwd_copy.py research/data/gmgn_wallets.txt results/fwd_copy.json 180
+  python research/fwd_copy.py research/data/axiom_kols.txt results/fwd_copy.json 320 busy
+
+"busy" is for famous wallets that get thousands of spam transactions a minute: it reads every new
+signature (several pages per cycle), never drops a wallet as a bot, and counts only transactions
+the wallet signed itself that spent at least MIN_BUY_SOL.
 """
 
 import json
@@ -20,6 +25,8 @@ import insiders as I  # noqa: E402
 I.RATE = 20
 TRACK_H = 4
 CYCLE = 20  # seconds
+MIN_BUY_SOL = 0.02  # busy mode: smaller "buys" are airdropped spam tokens
+BUSY_PAGES = 5
 NOT_COINS = {"So11111111111111111111111111111111111111112",   # wrapped SOL
              "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",   # USDC
              "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"}   # USDT
@@ -27,6 +34,7 @@ NOT_COINS = {"So11111111111111111111111111111111111111112",   # wrapped SOL
 
 def main():
     wfile, out, minutes = sys.argv[1], sys.argv[2], float(sys.argv[3])
+    busy = len(sys.argv) > 4 and sys.argv[4] == "busy"
     labels = {}
     for line in open(wfile):
         p = line.split()
@@ -41,10 +49,20 @@ def main():
     print(f"following {len(wallets)} wallets", flush=True)
 
     def poll(w):
-        p = {"limit": 25}
-        if last.get(w):
-            p["until"] = last[w]
-        return w, I.rpc("getSignaturesForAddress", [w, p]) or []
+        if not busy:
+            p = {"limit": 25}
+            if last.get(w):
+                p["until"] = last[w]
+            return w, I.rpc("getSignaturesForAddress", [w, p]) or []
+        out, before = [], None
+        for _ in range(BUSY_PAGES):
+            p = {"limit": 1000, **({"until": last[w]} if last.get(w) else {}), **({"before": before} if before else {})}
+            page = I.rpc("getSignaturesForAddress", [w, p]) or []
+            out += page
+            if len(page) < 1000:
+                break
+            before = page[-1]["signature"]
+        return w, out
 
     cycle = 0
     while time.time() < end:
@@ -57,7 +75,7 @@ def main():
             if not sigs:
                 continue
             last[w] = sigs[0]["signature"]
-            if len(sigs) >= 25:  # 25+ transactions in one cycle: a bot, stop following
+            if not busy and len(sigs) >= 25:  # 25+ transactions in one cycle: a bot, stop following
                 noisy[w] = noisy.get(w, 0) + 1
                 if noisy[w] >= 2 and w in wallets:
                     wallets.remove(w)
@@ -66,8 +84,14 @@ def main():
             new += [(w, s) for s in sigs if not s.get("err")]
         seen = time.time()
         for (w, s), tx in zip(new, I.txs([s["signature"] for _, s in new], threads=8)):
+            if busy and tx:
+                k0 = tx["transaction"]["message"]["accountKeys"][0]
+                if (k0["pubkey"] if isinstance(k0, dict) else k0) != w:
+                    continue  # someone else's transaction that mentions the wallet (spam)
             for owner, mint, d, sol in I.token_moves(tx):
                 if owner != w or mint in NOT_COINS:
+                    continue
+                if busy and d > 0 and -sol < MIN_BUY_SOL:
                     continue
                 side = "buy" if d > 0 else "sell"
                 tr = tracked.get(mint)

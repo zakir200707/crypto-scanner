@@ -11,6 +11,9 @@ on:
       minutes:
         description: "How long to follow them"
         default: "320"
+      mode:
+        description: "'busy' for famous wallets flooded with spam transactions, else empty"
+        default: ""
 
 permissions:
   contents: read
@@ -26,7 +29,7 @@ jobs:
           python-version: "3.12"
       - name: Follow wallets
         timeout-minutes: 340
-        run: python research/fwd_copy.py "${{ inputs.wallets }}" fwd_copy.json "${{ inputs.minutes }}"
+        run: python research/fwd_copy.py "${{ inputs.wallets }}" fwd_copy.json "${{ inputs.minutes }}" ${{ inputs.mode }}
       - uses: actions/upload-artifact@v4
         if: always()
         with:
