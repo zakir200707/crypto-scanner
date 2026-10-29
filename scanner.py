@@ -61,6 +61,12 @@ MAX_PUMP_1H = 25          # % up in the last hour: the pump is already under way
 # Report card of 48 best picks (24-28 Oct): picks with 1.25x+ more buying than selling wallets made
 # +16% / +4% per trade in the older / newer half; the rest -11%. 4 of the 6 losing alerts had fewer buyers.
 MIN_BUY_RATIO = 1.25      # unique buyer / seller wallets in the last 300 trades, needed to alert
+# Self-check. Scored from the moment they were sent (research/score_alerts_live.py), the 33 alerts of
+# 24-29 Oct made +6% per trade in the older half and -22% in the newer half, with every sell plan tried.
+# So buy alerts only reach the phone while the last GATE_N finished alerts (real or paper) averaged
+# above GATE_MIN_AVG; otherwise they are followed as paper trades until the record recovers.
+GATE_N = 10
+GATE_MIN_AVG = 0.0
 MAX_DRIFT = 10            # % the price may move while the scan runs before the alert is dropped
 MAX_WHALE_EXIT = 0.2      # whales net selling more than this share of liquidity in 6h: reject
 BUY_LIMIT = 1.10          # alerts say "don't buy above" this multiple of the alert price
@@ -667,10 +673,38 @@ def main():
         except ValueError:
             last = {"main": raw}  # older single-pick format
 
+    def gate():
+        """(phone alerts on?, average of the last GATE_N finished alerts or None while there are fewer)."""
+        done = [c["ret"] for c in last.get("closed", [])][-GATE_N:]
+        if len(done) < GATE_N:
+            return True, None
+        avg = sum(done) / len(done)
+        return avg > GATE_MIN_AVG, avg
+
+    def gate_notice():
+        """One low-priority message whenever buy alerts switch off or back on."""
+        on, avg = gate()
+        if last.get("gate_on", True) == on:
+            return
+        last["gate_on"] = on
+        msg = (f"Buy alerts RESUMED: the last {GATE_N} picks averaged {avg:+.0%} per trade." if on else
+               f"Buy alerts PAUSED: the last {GATE_N} picks averaged {avg:+.0%} per trade. I keep testing picks "
+               f"silently (paper trades) and switch alerts back on when that turns positive.")
+        print(msg)
+        if a.ntfy:
+            try:
+                req = urllib.request.Request(f"https://ntfy.sh/{a.ntfy}", data=msg.encode(),
+                                             headers={"Title": "Scanner self-check", "Priority": "low"})
+                urllib.request.urlopen(req, timeout=15)
+            except Exception as e:
+                print(f"push failed: {e}")
+
     def alert(best):
-        """Alert on a tier's top pick at most once per coin per 24h; returns True if anything fired."""
+        """Alert on a tier's top pick at most once per coin per 24h; returns True if anything fired.
+        While the self-check is off, the pick is followed as a paper trade instead of pushed."""
         fired = False
         now = time.time()
+        live, _ = gate()
         sent = {m: t for m, t in last.get("alerted", {}).items() if now - t < 86400}
         for tier, bar in (("main", ALERT_MAIN), ("early", ALERT_EARLY)):
             b = best.get(tier)
@@ -681,13 +715,14 @@ def main():
             if skip:
                 print(f"not alerting {b['symbol']}: {skip}")
             elif b and b["mint"] not in sent and b["score"] >= bar:
-                print(f"\a*** NEW {tier.upper()} PICK: {b['symbol']} ***")
-                if a.ntfy:
+                print(f"\a*** NEW {tier.upper()} PICK: {b['symbol']} ***" + ("" if live else " (paper: alerts paused)"))
+                if a.ntfy and live:
                     push(a.ntfy, b)
                 sent[b["mint"]] = now
                 last.setdefault("open", {})[b["mint"]] = {"sym": b["symbol"], "pair": b["pair"], "price": b["price"],
-                                                          "t": now, "stage": 0, "url": b["url"], "bs": round(ratio, 2)}
-                fired = True
+                                                          "t": now, "stage": 0, "url": b["url"], "bs": round(ratio, 2),
+                                                          "paper": not live}
+                fired = live
             last[tier] = b["mint"] if b else None
         last["alerted"] = sent
         return fired
@@ -717,8 +752,8 @@ def main():
             elif now - o["t"] > 72 * 3600:
                 msg = f"72h since the alert, now {(r - 1) * 100:+.0f}%. If you still hold it, sell."
             if msg:
-                print(f"follow-up {o['sym']}: {msg}")
-                if a.ntfy:
+                print(f"follow-up {o['sym']}{' (paper)' if o.get('paper') else ''}: {msg}")
+                if a.ntfy and not o.get("paper"):
                     try:
                         body = f"{o['sym']}: {msg}\nAlert price {fmt_price(o['price'])}, now {fmt_price(px)} at {uk_now()}\n" \
                                f"Sell on Axiom: {axiom(o['pair'])}\nChart: {o['url']}"
@@ -732,7 +767,7 @@ def main():
                     # result of following the plan (half sold at +50% once stage 1 was reached), after ~3% costs
                     ret = (0.25 + 0.5 * (r - 1)) if o["stage"] == 1 else (r - 1)
                     last.setdefault("closed", []).append({"sym": o["sym"], "t": now, "ret": round(ret - 0.03, 4),
-                                                          "bs": o.get("bs")})
+                                                          "bs": o.get("bs"), "paper": o.get("paper", False)})
                     last["closed"] = last["closed"][-300:]
                     del last["open"][mint]
 
@@ -760,8 +795,11 @@ def main():
             lines.append(f"Alert results so far: {len(done)} finished, {sum(c['ret'] > 0 for c in done)} won, "
                          f"avg {sum(c['ret'] for c in done) / len(done):+.0%} per trade"
                          + (f" (last 7 days: {len(wk)}, avg {sum(wk) / len(wk):+.0%})" if wk else ""))
+        on, avg = gate()
+        lines.append(f"Buy alerts {'ON' if on else 'PAUSED (paper trades only)'}"
+                     + (f": last {GATE_N} picks avg {avg:+.0%} per trade" if avg is not None else ""))
         if last.get("open"):
-            lines.append(f"Still following: {', '.join(o['sym'] for o in last['open'].values())}")
+            lines.append(f"Still following: {', '.join(o['sym'] + (' (paper)' if o.get('paper') else '') for o in last['open'].values())}")
         lines.append(f"Sent {uk_now()}")
         print("DAILY REPORT\n" + "\n".join(lines))
         if a.ntfy:
@@ -788,6 +826,7 @@ def main():
         best = report(passed, rejected, s1)
         print(f"\nsaved {save(passed, rejected)}")
         follow_up()
+        gate_notice()
         fired = alert(best)
         daily_report(best, fired)
         if a.state:
