@@ -65,8 +65,10 @@ MIN_BUY_RATIO = 1.25      # unique buyer / seller wallets in the last 300 trades
 # 24-29 Oct made +6% per trade in the older half and -22% in the newer half, with every sell plan tried.
 # So buy alerts only reach the phone while the last GATE_N finished alerts (real or paper) averaged
 # above GATE_MIN_AVG; otherwise they are followed as paper trades until the record recovers.
-GATE_N = 10
-GATE_MIN_AVG = 0.0
+# 10 trades at 0% was too loose: resampling the 45 coins the filters passed (avg -13%), it reopened by luck
+# in 75% of runs within 60 trades. 30 trades at +5% reopens in about 2%.
+GATE_N = 30
+GATE_MIN_AVG = 0.05
 MAX_DRIFT = 10            # % the price may move while the scan runs before the alert is dropped
 MAX_WHALE_EXIT = 0.2      # whales net selling more than this share of liquidity in 6h: reject
 BUY_LIMIT = 1.10          # alerts say "don't buy above" this multiple of the alert price
@@ -674,12 +676,10 @@ def main():
             last = {"main": raw}  # older single-pick format
 
     def gate():
-        """(phone alerts on?, average of the last GATE_N finished alerts or None while there are fewer)."""
+        """(phone alerts on?, average of the last GATE_N finished alerts). Off until there are GATE_N of them."""
         done = [c["ret"] for c in last.get("closed", [])][-GATE_N:]
-        if len(done) < GATE_N:
-            return True, None
-        avg = sum(done) / len(done)
-        return avg > GATE_MIN_AVG, avg
+        avg = sum(done) / len(done) if done else 0.0
+        return len(done) >= GATE_N and avg > GATE_MIN_AVG, avg
 
     def gate_notice():
         """One low-priority message whenever buy alerts switch off or back on."""
@@ -688,7 +688,7 @@ def main():
             return
         last["gate_on"] = on
         msg = (f"Buy alerts RESUMED: the last {GATE_N} picks averaged {avg:+.0%} per trade." if on else
-               f"Buy alerts PAUSED: the last {GATE_N} picks averaged {avg:+.0%} per trade. I keep testing picks "
+               f"Buy alerts PAUSED: the last picks averaged {avg:+.0%} per trade. I keep testing picks "
                f"silently (paper trades) and switch alerts back on when that turns positive.")
         print(msg)
         if a.ntfy:
@@ -796,8 +796,8 @@ def main():
                          f"avg {sum(c['ret'] for c in done) / len(done):+.0%} per trade"
                          + (f" (last 7 days: {len(wk)}, avg {sum(wk) / len(wk):+.0%})" if wk else ""))
         on, avg = gate()
-        lines.append(f"Buy alerts {'ON' if on else 'PAUSED (paper trades only)'}"
-                     + (f": last {GATE_N} picks avg {avg:+.0%} per trade" if avg is not None else ""))
+        lines.append(f"Buy alerts {'ON' if on else 'PAUSED (paper trades only)'}: last {min(len(done), GATE_N)} picks "
+                     f"avg {avg:+.0%} per trade")
         if last.get("open"):
             lines.append(f"Still following: {', '.join(o['sym'] + (' (paper)' if o.get('paper') else '') for o in last['open'].values())}")
         lines.append(f"Sent {uk_now()}")
