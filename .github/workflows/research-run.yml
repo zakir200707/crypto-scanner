@@ -28,6 +28,12 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install websockets==16.0
+      - name: Restore the live watcher's history (read-only, never saved back)
+        uses: actions/cache/restore@v4
+        with:
+          path: state
+          key: research-none
+          restore-keys: live-
       - name: Run
         timeout-minutes: 340
         run: |
