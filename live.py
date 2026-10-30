@@ -348,7 +348,7 @@ class Watcher:
 
     def push(self, title, body, url="", priority="default"):
         print(f"\n[{title}]\n{body}\n", flush=True)
-        if not self.args.ntfy:
+        if not self.args.ntfy or not PHONE_ALERTS:
             return
         try:
             req = urllib.request.Request(f"https://ntfy.sh/{self.args.ntfy}", data=body.encode(),
