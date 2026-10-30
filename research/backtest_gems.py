@@ -1,10 +1,11 @@
-"""Do any "older gem" setups beat random entries? Coins 2h+ past graduation, on the unbiased set of
-953 graduated Pump.fun coins (results/grads_gh, 5-minute candles, dead coins included).
+"""Do any "older gem" setups beat random entries? Coins 2h+ past graduation, on 5-minute candles.
+Train: 953 graduated Pump.fun coins of 25-26 Oct (results/grads_gh, dead coins included).
+Test: this week's coins that were alive 20+ min after graduation (results/recent_cloud/files/recent).
 
 Signal at a candle close; entry = next candle's open + 2%; one trade per coin per rule. A stop fills
 at the stop or at the candle's open if it gapped through, and comes first when a candle hits both.
-Costs 3.7% (Axiom 0.95% a side, 1% slippage, $0.04 of fees on $5). Rules are ranked on the older half
-of the coins and judged on the newer half; each is compared with random entries in the same band.
+Costs 3.7% (Axiom 0.95% a side, 1% slippage, $0.04 of fees on $5). Rules are ranked on the train
+period and judged on the test period; each is compared with random entries in the same band.
 
   python research/backtest_gems.py
 """
@@ -23,14 +24,14 @@ STEP = 300
 H = 12               # 5-minute candles per hour
 MIN_V1H = 5000       # USD traded in the last hour, or a small order moves the price
 AGES = {"2-12h": (2, 12), "12-48h": (12, 48), "48h+": (48, 1e9)}
-MCS = {"$30-100K": (3e4, 1e5), "$100-300K": (1e5, 3e5), "$300K-1M": (3e5, 1e6), "$1M+": (1e6, 1e12)}
+MCS = {"$30-300K": (3e4, 3e5), "$300K+": (3e5, 1e12)}
 EXITS = {"TP30/SL20/6h": (0.3, 0.2, 6), "TP50/SL25/24h": (0.5, 0.25, 24), "TP100/SL35/48h": (1.0, 0.35, 48),
          "SL25/24h": (None, 0.25, 24)}
 
 
 def load():
     coins = []
-    for f in glob.glob("results/grads_gh/*.json"):
+    for f in glob.glob("results/grads_gh/*.json") + glob.glob("results/recent_cloud/files/recent/*.json"):
         d = json.load(open(f))
         k = d.get("candles") or []
         if len(k) < 30:
@@ -138,7 +139,7 @@ def main():
     sys.stdout.reconfigure(encoding="utf-8")
     coins = load()
     print(f"{len(coins)} coins, {sum(c['n'] > 0 for c in coins)} with 30+ candles")
-    cut = coins[len(coins) // 2]["grad"]
+    cut = 1793059200  # 27 Oct 00:00 UTC, between the two collection periods
     res = defaultdict(lambda: ([], []))
     rnd = random.Random(1)
     for x in coins:
@@ -165,10 +166,21 @@ def main():
                         v = trade(x, i, tp, sl, hold)
                         if v is not None:
                             res[(rn, an, mn, en)][part].append(v)
-    rows = [(k, a, b) for k, (a, b) in res.items() if len(a) >= 15 and len(b) >= 15]
+    pool = defaultdict(lambda: ([], []))
+    for (rn, an, mn, en), (a, b) in res.items():
+        pool[(rn, en)][0].extend(a)
+        pool[(rn, en)][1].extend(b)
+    pr = [(k, a, b) for k, (a, b) in pool.items() if len(a) >= 3 and len(b) >= 3]
+    print(f"each rule pooled over ages and sizes: {len(pr)} rule/exit pairs, "
+          f"{sum(statistics.mean(a) > 0 and statistics.mean(b) > 0 for k, a, b in pr)} positive in both periods")
+    for k, a, b in sorted(pr, key=lambda r: -statistics.mean(r[1] + r[2]))[:40]:
+        v = a + b
+        print(f"  {statistics.mean(v):+6.1%} t={tstat(v):5.1f} win {sum(x > 0 for x in v) / len(v):3.0%} "
+              f"train {statistics.mean(a):+6.1%} n={len(a):3d} test {statistics.mean(b):+6.1%} n={len(b):3d}  {' | '.join(k)}")
+    rows = [(k, a, b) for k, (a, b) in res.items() if len(a) >= 10 and len(b) >= 10]
     json.dump({" | ".join(k): [a, b] for k, a, b in rows}, open("results/gems_backtest.json", "w"))
     pos = [r for r in rows if not r[0][0].startswith("baseline")]
-    print(f"{len(pos)} rule/band/exit combos with 15+ trades in both halves")
+    print(f"{len(pos)} rule/band/exit combos with 10+ trades in both periods")
     print(f"positive on train: {sum(statistics.mean(r[1]) > 0 for r in pos)}; "
           f"positive on both: {sum(statistics.mean(r[1]) > 0 and statistics.mean(r[2]) > 0 for r in pos)}")
     print("\nrandom entries (baseline), mean per trade:")
@@ -179,7 +191,7 @@ def main():
     for k, a, b in sorted(pos, key=lambda r: -statistics.mean(r[1]))[:15]:
         print(f"  {statistics.mean(a):+6.1%} n={len(a):3d} -> test {statistics.mean(b):+6.1%} n={len(b):3d} "
               f"win {sum(x > 0 for x in b) / len(b):.0%}  {' | '.join(k)}")
-    print("\npositive on both halves, by combined t-stat:")
+    print("\npositive on both periods, by combined t-stat:")
     both = [r for r in pos if statistics.mean(r[1]) > 0 and statistics.mean(r[2]) > 0]
     for k, a, b in sorted(both, key=lambda r: tstat(r[1] + r[2]), reverse=True)[:20]:
         print(f"  t={tstat(a + b):4.1f} train {statistics.mean(a):+6.1%} n={len(a):3d} | test {statistics.mean(b):+6.1%} n={len(b):3d} "
