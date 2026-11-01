@@ -69,6 +69,9 @@ MIN_BUY_RATIO = 1.25      # unique buyer / seller wallets in the last 300 trades
 # in 75% of runs within 60 trades. 30 trades at +5% reopens in about 2%.
 GATE_N = 30
 GATE_MIN_AVG = 0.05
+# The user's choice (1 Nov): send picks despite the record, which is shown in every alert. Set False to let
+# the self-check decide again. Filters stay as strict as they were: score and market cap did not separate winners.
+ALERTS_FORCED_ON = True
 MAX_DRIFT = 10            # % the price may move while the scan runs before the alert is dropped
 MAX_WHALE_EXIT = 0.2      # whales net selling more than this share of liquidity in 6h: reject
 BUY_LIMIT = 1.10          # alerts say "don't buy above" this multiple of the alert price
@@ -619,7 +622,7 @@ def axiom(pair):
     return f"https://axiom.trade/meme/{pair}"
 
 
-def push(topic, b):
+def push(topic, b, record):
     """Phone alert via ntfy.sh (install the ntfy app and subscribe to the same topic)."""
     msg = (f"{b['name']} ({b['symbol']}) score {b['score']}\n"
            f"Price {fmt_price(b['price'])} at {uk_now()}\n"
@@ -631,7 +634,7 @@ def push(topic, b):
            f"radar {b['radar']} smart wallet(s)\n"
            f"Whales net 6h ${b['whale_net_6h']:,.0f} | accumulators {b['accumulators']} | "
            f"smart wallets {b['smart_buyers']}\n"
-           f"{'; '.join(b['risks']) or 'no rugcheck warnings'}\n"
+           f"{'; '.join(b['risks']) or 'no rugcheck warnings'}\n{record}\n"
            f"Trade on Axiom: {axiom(b['pair'])}\nChart: {b['url']}")
     kind = "EARLY GEM (high risk)" if b["tier"] == "early" else "New pick"
     title = f"{kind}: {b['symbol']}".encode("ascii", "ignore").decode()
@@ -676,10 +679,11 @@ def main():
             last = {"main": raw}  # older single-pick format
 
     def gate():
-        """(phone alerts on?, average of the last GATE_N finished alerts). Off until there are GATE_N of them."""
+        """(phone alerts on?, average of the last GATE_N finished alerts). Off until there are GATE_N of them,
+        unless ALERTS_FORCED_ON."""
         done = [c["ret"] for c in last.get("closed", [])][-GATE_N:]
         avg = sum(done) / len(done) if done else 0.0
-        return len(done) >= GATE_N and avg > GATE_MIN_AVG, avg
+        return ALERTS_FORCED_ON or (len(done) >= GATE_N and avg > GATE_MIN_AVG), avg
 
     def gate_notice():
         """One low-priority message whenever buy alerts switch off or back on."""
@@ -687,7 +691,7 @@ def main():
         if last.get("gate_on", True) == on:
             return
         last["gate_on"] = on
-        msg = (f"Buy alerts RESUMED: the last {GATE_N} picks averaged {avg:+.0%} per trade." if on else
+        msg = (f"Buy alerts ON. The last picks averaged {avg:+.0%} per trade, so treat each one as high risk." if on else
                f"Buy alerts PAUSED: the last picks averaged {avg:+.0%} per trade. I keep testing picks "
                f"silently (paper trades) and switch alerts back on when that turns positive.")
         print(msg)
@@ -704,7 +708,8 @@ def main():
         While the self-check is off, the pick is followed as a paper trade instead of pushed."""
         fired = False
         now = time.time()
-        live, _ = gate()
+        live, avg = gate()
+        record = f"Scanner record: last {len(last.get('closed', [])[-GATE_N:])} picks avg {avg:+.0%} per trade."
         sent = {m: t for m, t in last.get("alerted", {}).items() if now - t < 86400}
         for tier, bar in (("main", ALERT_MAIN), ("early", ALERT_EARLY)):
             b = best.get(tier)
@@ -717,7 +722,7 @@ def main():
             elif b and b["mint"] not in sent and b["score"] >= bar:
                 print(f"\a*** NEW {tier.upper()} PICK: {b['symbol']} ***" + ("" if live else " (paper: alerts paused)"))
                 if a.ntfy and live:
-                    push(a.ntfy, b)
+                    push(a.ntfy, b, record)
                 sent[b["mint"]] = now
                 last.setdefault("open", {})[b["mint"]] = {"sym": b["symbol"], "pair": b["pair"], "price": b["price"],
                                                           "t": now, "stage": 0, "url": b["url"], "bs": round(ratio, 2),
