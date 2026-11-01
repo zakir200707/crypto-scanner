@@ -771,7 +771,7 @@ def main():
                 if close:
                     # result of following the plan (half sold at +50% once stage 1 was reached), after ~3% costs
                     ret = (0.25 + 0.5 * (r - 1)) if o["stage"] == 1 else (r - 1)
-                    last.setdefault("closed", []).append({"sym": o["sym"], "t": now, "ret": round(ret - 0.03, 4),
+                    last.setdefault("closed", []).append({"sym": o["sym"], "mint": mint, "t": now, "ret": round(ret - 0.03, 4),
                                                           "bs": o.get("bs"), "paper": o.get("paper", False)})
                     last["closed"] = last["closed"][-300:]
                     del last["open"][mint]
@@ -828,7 +828,10 @@ def main():
                                                           "price": m["price"], "mc": m["mc"]})
         last["passed_log"] = last.get("passed_log", [])[-3000:]
         save_db()
-        best = report(passed, rejected, s1)
+        # A coin that lost once, or is still being followed, is not picked again: HI came back a day after its stop,
+        # and a second alert would overwrite the open coin's entry price and hide its loss from the record.
+        dead = {c.get("mint") for c in last.get("closed", []) if c["ret"] < 0} | set(last.get("open", {}))
+        best = report([m for m in passed if m["mint"] not in dead], rejected, s1)
         print(f"\nsaved {save(passed, rejected)}")
         follow_up()
         gate_notice()
