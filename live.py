@@ -43,6 +43,7 @@ DEAD_MC = 6000        # drop coins still below this market cap ...
 DEAD_AFTER = 20 * 60  # ... after this many seconds
 LOG_MC = 5000         # only log coins once they have reached this market cap
 KEEP_H = 48           # backtest window
+ARCHIVE_H = 240       # snapshot files stay this long for research; only the last KEEP_H feed the rules
 RETEST = 3600         # seconds between backtests
 COST = 0.03           # round-trip fees + slippage
 MIN_COINS = 25        # a rule needs this many past trades before it may alert
@@ -331,7 +332,7 @@ class Watcher:
             os.makedirs(os.path.dirname(self.log_path) or ".", exist_ok=True)
         self.log = open(self.log_path, "a", encoding="utf-8") if self.log_path else None
         self.state_path = os.path.join(args.state, "live.json") if args.state else None
-        self.state = {"alerted": {}, "open": {}, "closed": [], "report_day": "", "stats": {}, "live": {}}
+        self.state = {"alerted": {}, "open": {}, "closed": [], "report_day": "", "stats": {}, "live": {}, "tracked": {}}
         if self.state_path and os.path.exists(self.state_path):
             self.state.update(json.load(open(self.state_path, encoding="utf-8")))
         self.last_test = 0
@@ -340,9 +341,14 @@ class Watcher:
         for mint, o in self.state["open"].items():  # keep following positions opened by an earlier run
             self.coins[mint] = {"born": None, "sym": o["sym"], "dev_sol": 0, "grad": o.get("grad") or o["t"],
                                 "logged": True, "hist": [], "added": time.time(), "grad_seen": True}
+        for mint, t in self.state["tracked"].items():  # survivors stay followed across the 5.6h jobs
+            self.coins.setdefault(mint, {"born": None, "sym": t["sym"], "dev_sol": t["dev_sol"], "grad": t["grad"],
+                                         "logged": True, "hist": [], "added": time.time(), "grad_seen": True})
 
     def save(self):
         if self.state_path:
+            self.state["tracked"] = {m: {"sym": c["sym"], "dev_sol": c["dev_sol"], "grad": c["grad"]}
+                                     for m, c in self.coins.items() if c["grad"]}
             with open(self.state_path, "w", encoding="utf-8") as f:
                 json.dump(self.state, f)
 
@@ -392,7 +398,8 @@ class Watcher:
             if mint in self.state["open"]:
                 continue
             if c["grad"]:  # graduated: follow survivors for up to 48h, drop the ones that died
-                if now - c["grad"] > GRAD_TRACK_H * 3600 or (now - c["grad"] > 1800 and (not last or last["mc"] < DEAD_MC)):
+                if now - c["grad"] > GRAD_TRACK_H * 3600 or (now - max(c["grad"], c.get("added", 0)) > 1800
+                                                             and (not last or last["mc"] < DEAD_MC)):
                     del self.coins[mint]
             elif now - start > TRACK_H * 3600 or (now - start > DEAD_AFTER and (not last or last["mc"] < DEAD_MC)):
                 del self.coins[mint]
@@ -575,9 +582,10 @@ class Watcher:
         self.last_test = time.time()
         snaps = os.path.join(self.args.state, "snaps")
         for p in glob.glob(os.path.join(snaps, "*.jsonl*")):
-            if os.path.getmtime(p) < time.time() - (KEEP_H + 6) * 3600:
+            if os.path.getmtime(p) < time.time() - ARCHIVE_H * 3600:
                 os.remove(p)
-        paths = glob.glob(os.path.join(snaps, "*.jsonl*")) + glob.glob("data/*.jsonl*")
+        paths = [p for p in glob.glob(os.path.join(snaps, "*.jsonl*")) + glob.glob("data/*.jsonl*")
+                 if os.path.getmtime(p) >= time.time() - (KEEP_H + 6) * 3600]
         coins = load_history(paths)
         stats = backtest(coins)
         live = live_rules(stats)
