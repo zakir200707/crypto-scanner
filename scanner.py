@@ -627,7 +627,7 @@ def push(topic, b, record):
     msg = (f"{b['name']} ({b['symbol']}) score {b['score']}\n"
            f"Price {fmt_price(b['price'])} at {uk_now()}\n"
            f"DON'T BUY ABOVE {fmt_price(b['price'] * BUY_LIMIT)} - if it's higher you're late, skip it.\n"
-           f"Plan: stop {fmt_price(b['price'] * 0.75)} (-25%), sell half at {fmt_price(b['price'] * 1.5)} (+50%). Max $10.\n"
+           f"Plan: stop {fmt_price(b['price'] * 0.75)} (-25%), sell EVERYTHING at {fmt_price(b['price'] * 1.5)} (+50%). Max $10.\n"
            f"Buyers {b['uniq_buyers']} vs sellers {b['uniq_sellers']} (last 300 trades)\n"
            f"MC {fmt_money(b['mc'])} | liq {fmt_money(b['liq'])} | {b['from_24h_high']:.0f}% off 24h high\n"
            f"Up {b['from_24h_low']:.0f}% from 24h low | volume {b['vol_accel']:.1f}x | "
@@ -733,8 +733,10 @@ def main():
         return fired
 
     def follow_up():
-        """Follow each alerted coin and say when its plan says to sell: half at +50% (then the rest
-        at +100% or back at the buy price), everything at -25%, or a reminder after 72h."""
+        """Follow each alerted coin and say when its plan says to sell: everything at +50% or -25%,
+        or a reminder after 72h. Selling all at +50% beat selling half on the 41 real alerts and the
+        64 passed coins, in both periods (research/score_late.py, score_fees.py). Stage 1 only finishes
+        coins that had already sold half under the old plan."""
         now = time.time()
         for mint, o in list(last.get("open", {}).items()):
             p = ((get(f"{DEX}/latest/dex/pairs/solana/{o['pair']}") or {}).get("pairs") or [None])[0]
@@ -742,12 +744,9 @@ def main():
             if not px:
                 continue
             r = px / o["price"]
-            msg, close = None, True
+            msg = None
             if o["stage"] == 0 and r >= 1.5:
-                msg, o["stage"] = (f"TARGET HIT +{(r - 1) * 100:.0f}%: sell HALF now. Keep the rest, and sell it at "
-                                   f"{fmt_price(o['price'] * 2)} (+100%) or if it falls back to your buy price "
-                                   f"{fmt_price(o['price'])}."), 1
-                close = False
+                msg = f"TARGET HIT +{(r - 1) * 100:.0f}%: sell EVERYTHING now."
             elif o["stage"] == 0 and r <= 0.75:
                 msg = f"STOP HIT {(r - 1) * 100:.0f}%: sell now. Small loss is the plan working."
             elif o["stage"] == 1 and r >= 2:
@@ -768,13 +767,12 @@ def main():
                         urllib.request.urlopen(req, timeout=15)
                     except Exception as e:
                         print(f"push failed: {e}")
-                if close:
-                    # result of following the plan (half sold at +50% once stage 1 was reached), after ~3% costs
-                    ret = (0.25 + 0.5 * (r - 1)) if o["stage"] == 1 else (r - 1)
-                    last.setdefault("closed", []).append({"sym": o["sym"], "mint": mint, "t": now, "ret": round(ret - 0.03, 4),
-                                                          "bs": o.get("bs"), "paper": o.get("paper", False)})
-                    last["closed"] = last["closed"][-300:]
-                    del last["open"][mint]
+                # result of following the plan (stage 1 had already sold half at +50%), after ~3% costs
+                ret = (0.25 + 0.5 * (r - 1)) if o["stage"] == 1 else (r - 1)
+                last.setdefault("closed", []).append({"sym": o["sym"], "mint": mint, "t": now, "ret": round(ret - 0.03, 4),
+                                                      "bs": o.get("bs"), "paper": o.get("paper", False)})
+                last["closed"] = last["closed"][-300:]
+                del last["open"][mint]
 
     def daily_report(best, fired):
         """Track every run; once a day after REPORT_HOUR_UTC send a 'still alive' summary."""
